@@ -1,30 +1,29 @@
-"""OBS 比赛录制助手 V0.2。"""
+"""OBS 比赛录制助手：GUI 主程序。
+
+业务逻辑（直播源管理、监控循环）在 source_manager.py，
+配置校验在 config.py，本文件只负责界面、任务编排与日志。
+"""
 
 from __future__ import annotations
 
 import tkinter as tk
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from urllib.parse import urlparse
 
 from .browser import BrowserController, BrowserControllerError
-from .config import AppConfig, load_config, save_config
-from .detector import DetectionResult, LiveDetector
-from .monitor import SiteStatus, SourceMonitor
-from .obs_controller import (
-    OBSConnection,
-    OBSController,
-    OBSControllerError,
+from .config import (
+    AppConfig,
+    connection_from_config,
+    load_config,
+    save_config,
+    validate_config,
+    validate_obs_connection,
+    validate_sites,
 )
-from .player_adapter import (
-    PlayerControlError,
-    PlayerState,
-    adapter_for,
-)
+from .obs_controller import OBSController, OBSControllerError
 from .scheduler import TIME_FORMAT, scheduled_start_time
+from .source_manager import SourceManager
 
 
 class OBSMatchRecorderApp:
@@ -57,24 +56,19 @@ class OBSMatchRecorderApp:
 
         self.browser = BrowserController()
 
-        self.page_a = None
-        self.page_b = None
-
-        self.source_monitor: SourceMonitor | None = None
-
-        self.current_source: str | None = None
-        self.source_failure_counts = {"A": 0, "B": 0}
-
-        # 防止出现两个监控循环同时运行
-        self.monitor_loop_active = False
-
-        # 每次启动新的监控循环都会生成新的 ID。
-        # 旧循环即使还有 after 回调，也会自动失效。
-        self.monitor_loop_id = 0
-
         self.executor = ThreadPoolExecutor(
             max_workers=3,
             thread_name_prefix="obs-match-recorder",
+        )
+
+        # 直播源管理：页面操作 + 监控循环 + 源切换
+        self.sources = SourceManager(
+            browser=self.browser,
+            root=self.root,
+            executor=self.executor,
+            log=self.log,
+            safe_log=self._safe_log,
+            url_for_site=self._url_for_site,
         )
 
         self._build_interface()
@@ -427,7 +421,7 @@ class OBSMatchRecorderApp:
     def test_configuration(self) -> None:
         config = self._collect_config()
 
-        errors = self._validate_config(config)
+        errors = validate_config(config)
 
         if errors:
             message = "\n".join(errors)
@@ -461,7 +455,7 @@ class OBSMatchRecorderApp:
     def test_obs_connection(self) -> None:
         config = self._collect_config()
 
-        errors = self._validate_obs_connection(config)
+        errors = validate_obs_connection(config)
 
         if errors:
             messagebox.showwarning(
@@ -476,7 +470,7 @@ class OBSMatchRecorderApp:
 
         self._run_in_background(
             lambda: OBSController(
-                self._connection_from_config(config)
+                connection_from_config(config)
             ).test_connection(),
             self._show_obs_test_success,
         )
@@ -501,7 +495,7 @@ class OBSMatchRecorderApp:
     def test_browser(self) -> None:
         config = self._collect_config()
 
-        errors = self._validate_sites(config)
+        errors = validate_sites(config)
 
         if errors:
             messagebox.showwarning(
@@ -517,13 +511,13 @@ class OBSMatchRecorderApp:
         def work():
             self.browser.start()
 
-            page_a, page_b = self.browser.open_sites(
+            page_a, page_b = self.sources.open_sites(
                 config.site_a_url,
                 config.site_b_url,
             )
 
-            self._prepare_backup_page("A", page_a)
-            self._prepare_backup_page("B", page_b)
+            self.sources.prepare_backup_page("A", page_a)
+            self.sources.prepare_backup_page("B", page_b)
 
             return (
                 page_a,
@@ -543,9 +537,6 @@ class OBSMatchRecorderApp:
                 url_a,
                 url_b,
             ) = result
-
-            self.page_a = page_a
-            self.page_b = page_b
 
             self.log(
                 f"网站 A 打开成功：{title_a}"
@@ -587,8 +578,8 @@ class OBSMatchRecorderApp:
         config = self._collect_config()
 
         errors = (
-            self._validate_config(config)
-            + self._validate_obs_connection(config)
+            validate_config(config)
+            + validate_obs_connection(config)
         )
 
         if errors:
@@ -601,12 +592,11 @@ class OBSMatchRecorderApp:
         save_config(config)
 
         # 如果之前存在旧监控循环，先彻底作废
-        self._invalidate_monitor_loop()
+        self.sources.reset()
 
         self.task_active = True
+        self.sources.task_active = True
         self.recording_started_by_app = False
-        self.current_source = None
-        self.source_failure_counts = {"A": 0, "B": 0}
         self._cancel_recording_timer()
         self.recording_deadline = None
 
@@ -677,98 +667,28 @@ class OBSMatchRecorderApp:
         config = self._collect_config()
 
         def work():
-            self.browser.start()
-
-            page_a, page_b = self.browser.open_sites(
+            # 打开页面、探测、等待可用源、激活首选源
+            result = self.sources.open_and_select(
                 config.site_a_url,
                 config.site_b_url,
             )
 
-            # 两个页面都先关闭声音并关闭弹幕；真正使用的页面稍后再激活。
-            self._prepare_backup_page("A", page_a)
-            self._prepare_backup_page("B", page_b)
-
-            status_a = self._probe_source(
-                "A",
-                page_a,
-                config.site_a_url,
-            )
-            status_b = (
-                self._probe_source("B", page_b, config.site_b_url)
-                if page_b is not None
-                else SiteStatus(
-                    name="B",
-                    url="",
-                    result=self._unconfigured_result(),
-                )
-            )
-
-            monitor = SourceMonitor(
-                page_a=page_a,
-                page_b=page_b,
-                site_a_url=config.site_a_url,
-                site_b_url=config.site_b_url,
-                interval=5,
-            )
-
-            selected = monitor.choose_site(
-                status_a,
-                status_b,
-            )
-
-            # A/B 都没有可用直播源时：等待重试，而不是直接失败退出。
-            # 直播源经常在开赛前几分钟才拉流，需要轮询等待。
-            waiting_logged = False
-            while selected is None and self.task_active:
-                if not waiting_logged:
-                    self._safe_log(
-                        "A、B 两个网站当前都没有可用直播源，"
-                        "进入等待模式，每 5 秒检测一次……"
-                    )
-                    waiting_logged = True
-
-                time.sleep(5)
-
-                if not self.task_active:
-                    break
-
-                status_a, status_b = monitor.detect_once()
-                selected = monitor.choose_site(
-                    status_a,
-                    status_b,
-                )
-
-                if selected is not None:
-                    self._safe_log(
-                        "检测到可用直播源，继续启动录制流程。"
-                    )
-
-            if not self.task_active:
+            if result is None:
                 return None
 
-            if selected is None:
-                raise RuntimeError(
-                    "A、B 两个网站当前都没有可用直播源。"
-                )
-
-            selected, player_state = self._activate_first_ready_source(
-                selected.name,
+            (
                 page_a,
                 page_b,
+                monitor,
+                selected,
                 status_a,
                 status_b,
-            )
+                player_state,
+            ) = result
 
-            self._close_source_page(
-                "B" if selected.name == "A" else "A",
-                page_a,
-                page_b,
-            )
-
-            monitor.current_site = selected.name
-
+            # 浏览器与播放器就绪后，连接 OBS 并开始录制
             obs = OBSController(
-                self._connection_from_config(config)
+                connection_from_config(config)
             )
 
             obs.test_connection()
@@ -815,13 +735,12 @@ class OBSMatchRecorderApp:
             player_state,
         ) = result
 
-        self.page_a = page_a
-        self.page_b = page_b
-
-        self.source_monitor = monitor
+        self.sources.page_a = page_a
+        self.sources.page_b = page_b
+        self.sources.source_monitor = monitor
+        self.sources.current_site = selected.name
 
         self.recording_started_by_app = True
-        self.current_source = selected.name
 
         self.log(
             f"网站 A：{status_a.result.status} | "
@@ -871,343 +790,8 @@ class OBSMatchRecorderApp:
         )
 
         # 确保只启动一个监控循环
-        self._start_monitor_loop()
+        self.sources.start_monitor_loop()
 
-    # =========================================================
-    # 直播源监控
-    # =========================================================
-
-    def _invalidate_monitor_loop(self) -> None:
-        """
-        让之前所有已经排队的监控回调失效。
-        """
-
-        self.monitor_loop_id += 1
-        self.monitor_loop_active = False
-
-    def _start_monitor_loop(self) -> None:
-        if not self.task_active:
-            return
-
-        if self.source_monitor is None:
-            return
-
-        # 已经有一个循环在运行时，禁止再次启动
-        if self.monitor_loop_active:
-            return
-
-        self.monitor_loop_active = True
-
-        # 当前这一轮监控的唯一 ID
-        loop_id = self.monitor_loop_id + 1
-        self.monitor_loop_id = loop_id
-
-        self._run_monitor_detection(loop_id)
-
-    def _run_monitor_detection(
-        self,
-        loop_id: int,
-    ) -> None:
-        if not self.task_active:
-            self.monitor_loop_active = False
-            return
-
-        if loop_id != self.monitor_loop_id:
-            return
-
-        if self.source_monitor is None:
-            self.monitor_loop_active = False
-            return
-
-        monitor = self.source_monitor
-
-        def work():
-            return monitor.detect_once()
-
-        self._run_in_background(
-            work,
-            lambda result: self._process_monitor_result(
-                result,
-                loop_id,
-            ),
-            error_title="直播源检测失败",
-            on_error=lambda error: self._monitor_detection_failed(
-                error,
-                loop_id,
-            ),
-        )
-
-    def _monitor_detection_failed(self, error, loop_id: int) -> None:
-        if not self.task_active or loop_id != self.monitor_loop_id:
-            return
-
-        self.log(f"直播源检测异常：{error}。准备刷新当前源并继续监控。")
-
-        if self.current_source is not None:
-            site = self.current_source
-            self.monitor_loop_active = False
-            self._run_in_background(
-                lambda: self._refresh_source(site),
-                lambda _: self._schedule_next_monitor(loop_id),
-                error_title="刷新直播源失败",
-                on_error=lambda err: self._schedule_next_monitor(loop_id),
-            )
-            return
-
-        self._schedule_next_monitor(loop_id)
-
-    def _process_monitor_result(
-        self,
-        result,
-        loop_id: int,
-    ) -> None:
-        # 旧监控循环的结果直接丢弃
-        if loop_id != self.monitor_loop_id:
-            return
-
-        if not self.task_active:
-            self.monitor_loop_active = False
-            return
-
-        if self.source_monitor is None:
-            self.monitor_loop_active = False
-            return
-
-        status_a, status_b = result
-
-        statuses = {"A": status_a, "B": status_b}
-        current_status = statuses.get(self.current_source)
-
-        if self.current_source is not None:
-            if current_status and SourceMonitor._is_playing(current_status):
-                self.source_failure_counts[self.current_source] = 0
-            else:
-                self.source_failure_counts[self.current_source] += 1
-
-                # 先刷新当前页几次，给网络抖动和播放器重连留出时间。
-                if self.source_failure_counts[self.current_source] < 3:
-                    self.log(
-                        f"网站 {self.current_source} 播放异常，"
-                        f"第 {self.source_failure_counts[self.current_source]} 次重试并刷新页面。"
-                    )
-                    site = self.current_source
-                    self.monitor_loop_active = False
-                    self._run_in_background(
-                        lambda: self._refresh_source(site),
-                        lambda _: self._schedule_next_monitor(loop_id),
-                        error_title="刷新直播源失败",
-                        on_error=lambda err: self._schedule_next_monitor(loop_id),
-                    )
-                    return
-
-                alternate = "B" if self.current_source == "A" else "A"
-                self.log(
-                    f"网站 {self.current_source} 连续恢复失败，"
-                    f"重新打开备用网站 {alternate}。"
-                )
-                # URL 在主线程取好再传入后台线程，
-                # 避免后台线程读取 Tk 变量。
-                alternate_url = self._url_for_site(alternate)
-                self.monitor_loop_active = False
-                self._run_in_background(
-                    lambda: self._reopen_and_detect(
-                        alternate,
-                        alternate_url,
-                    ),
-                    lambda fresh: self._choose_and_maybe_switch(
-                        fresh,
-                        loop_id,
-                    ),
-                    error_title="切换备用源失败",
-                    on_error=lambda err: self._schedule_next_monitor(loop_id),
-                )
-                return
-
-        self._choose_and_maybe_switch(
-            (status_a, status_b),
-            loop_id,
-        )
-
-    def _reopen_and_detect(self, alternate: str, url: str):
-        """后台线程：重新打开备用源并重新检测两个源。"""
-
-        self._reopen_source(alternate, url)
-        return self.source_monitor.detect_once()
-
-    def _choose_and_maybe_switch(
-        self,
-        fresh_result,
-        loop_id: int,
-    ) -> None:
-        """主线程：选择最佳源；需要切换时把切换操作放到后台线程。"""
-
-        if not self.task_active or loop_id != self.monitor_loop_id:
-            return
-
-        status_a, status_b = fresh_result
-
-        selected = self.source_monitor.choose_site(
-            status_a,
-            status_b,
-        )
-
-        self.log(
-            f"网站 A：{status_a.result.status} | "
-            f"评分：{status_a.result.score} | "
-            f"播放：{status_a.result.video_playing}"
-        )
-
-        self.log(
-            f"网站 B：{status_b.result.status} | "
-            f"评分：{status_b.result.score} | "
-            f"播放：{status_b.result.video_playing}"
-        )
-
-        if selected is None:
-            self.log(
-                "当前 A/B 均无可用直播源，"
-                "保持 OBS 录制。"
-            )
-            self._schedule_next_monitor(loop_id)
-            return
-
-        if selected.name == self.current_source:
-            self.log(
-                f"当前直播源：网站 {selected.name}"
-            )
-            self._schedule_next_monitor(loop_id)
-            return
-
-        # 需要切换直播源：切换操作全部放到后台线程执行，
-        # 避免页面加载/播放器控制阻塞 GUI。
-        old_source = self.current_source
-        self.monitor_loop_active = False
-        self._run_in_background(
-            lambda: self._switch_source_work(
-                selected.name,
-                old_source,
-            ),
-            lambda player_state: self._switch_finished(
-                player_state,
-                selected,
-                old_source,
-                loop_id,
-            ),
-            error_title="直播源切换失败",
-            on_error=lambda err: self._monitor_switch_failed(
-                err,
-                loop_id,
-            ),
-        )
-
-    def _switch_source_work(self, site: str, old_source: str | None) -> PlayerState:
-        """后台线程：停用旧源、激活新源、关闭旧源页面。返回新源状态。"""
-
-        if old_source is not None:
-            self._deactivate_source(
-                old_source,
-                self.page_a,
-                self.page_b,
-            )
-
-        player_state = self._activate_source(
-            site,
-            self.page_a,
-            self.page_b,
-        )
-
-        if old_source is not None:
-            self._close_source_page(
-                old_source,
-                self.page_a,
-                self.page_b,
-            )
-
-        return player_state
-
-    def _switch_finished(
-        self,
-        player_state: PlayerState,
-        selected,
-        old_source: str | None,
-        loop_id: int,
-    ) -> None:
-        if not self.task_active or loop_id != self.monitor_loop_id:
-            self.monitor_loop_active = False
-            return
-
-        # 关键：切换后同步 SourceMonitor 内部的当前源记录，
-        # 否则 choose_site 会一直以为旧源还是当前源，导致 A/B 来回切换。
-        self.current_source = selected.name
-        if self.source_monitor is not None:
-            self.source_monitor.current_site = selected.name
-
-        if old_source is None:
-            self.log(
-                f"当前直播源：网站 {selected.name}"
-            )
-        else:
-            self.log(
-                f"直播源发生切换："
-                f"{old_source} → {selected.name}"
-            )
-
-            self.log(
-                f"当前地址：{selected.url}"
-            )
-
-            self.log(
-                "备用源已激活："
-                f"全屏={player_state.fullscreen}，"
-                f"静音={player_state.muted}"
-            )
-
-        self._schedule_next_monitor(loop_id)
-
-    def _monitor_switch_failed(self, error, loop_id: int) -> None:
-        if not self.task_active or loop_id != self.monitor_loop_id:
-            self.monitor_loop_active = False
-            return
-
-        self.log(
-            f"直播源切换失败：{error}。继续监控当前源。"
-        )
-        self._schedule_next_monitor(loop_id)
-
-    def _schedule_next_monitor(self, loop_id: int) -> None:
-        """统一安排下一轮监控检测（只能在主线程调用）。"""
-
-        self.monitor_loop_active = False
-
-        if not self.task_active:
-            return
-
-        if loop_id != self.monitor_loop_id:
-            return
-
-        self.root.after(
-            5000,
-            lambda: self._start_monitor_loop_if_valid(
-                loop_id
-            ),
-        )
-
-    def _start_monitor_loop_if_valid(
-        self,
-        loop_id: int,
-    ) -> None:
-        if not self.task_active:
-            return
-
-        if loop_id != self.monitor_loop_id:
-            return
-
-        if self.monitor_loop_active:
-            return
-
-        self._start_monitor_loop()
-
-    # =========================================================
     # 停止任务
     # =========================================================
 
@@ -1220,14 +804,8 @@ class OBSMatchRecorderApp:
         self._cancel_recording_timer()
         self.recording_deadline = None
 
-        # 立即让所有旧监控回调失效
-        self._invalidate_monitor_loop()
-
-        if self.source_monitor is not None:
-            try:
-                self.source_monitor.stop()
-            except Exception:
-                pass
+        # 停止直播源管理：作废所有旧监控回调并停止监控器
+        self.sources.stop()
 
         self.start_task_button.configure(
             state="normal"
@@ -1251,7 +829,7 @@ class OBSMatchRecorderApp:
 
         self._run_in_background(
             lambda: OBSController(
-                self._connection_from_config(config)
+                connection_from_config(config)
             ).stop_recording(),
             self._recording_stopped,
         )
@@ -1357,289 +935,12 @@ class OBSMatchRecorderApp:
         )
 
     # =========================================================
-    # 配置验证
+    # 配置辅助
     # =========================================================
-
-    @staticmethod
-    def _prepare_backup_page(site: str, page) -> None:
-        """准备备用页，但不抢占当前浏览器焦点，也不打开声音。"""
-
-        if page is None:
-            return
-
-        try:
-            adapter_for(site, page).prepare(activate=False)
-        except PlayerControlError:
-            # 页面可能还在广告/登录跳转中，后续检测和切换会再次尝试。
-            pass
-
-    def _probe_source(self, site: str, page, url: str) -> SiteStatus:
-        """串行唤醒并检测单个来源，确保另一个来源不会同时出声。"""
-
-        page.bring_to_front()
-        try:
-            adapter_for(site, page).prepare(activate=True)
-        except PlayerControlError:
-            pass
-
-        result = LiveDetector(page).detect()
-
-        try:
-            adapter_for(site, page).deactivate()
-        except Exception:
-            pass
-
-        return SiteStatus(name=site, url=url, result=result)
-
-    @staticmethod
-    def _unconfigured_result():
-        return DetectionResult(
-            status="未配置",
-            score=0,
-            page_ok=False,
-            player_found=False,
-            live_text_found=False,
-            error_found=False,
-            video_exists=False,
-            video_playing=False,
-            current_time=0.0,
-            video_width=0,
-            video_height=0,
-            details="网站 B 未配置",
-        )
-
-    def _refresh_source(self, site: str) -> None:
-        page = self._page_for_site(site, self.page_a, self.page_b)
-        if page is None or page.is_closed():
-            return
-
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=30000)
-            adapter_for(site, page).prepare(activate=True)
-            if self.source_monitor is not None:
-                self.source_monitor.reset_progress(site)
-        except Exception as error:
-            self._safe_log(f"网站 {site} 刷新失败：{error}")
-
-    def _reopen_source(self, site: str, url: str) -> None:
-        if not url:
-            self._safe_log(f"网站 {site} 未配置备用 URL，继续等待当前源恢复。")
-            return
-
-        page = self.browser.open_page(url)
-        self._prepare_backup_page(site, page)
-
-        if site == "A":
-            self.page_a = page
-        else:
-            self.page_b = page
-
-        if self.source_monitor is not None:
-            self.source_monitor.replace_page(site, page)
 
     def _url_for_site(self, site: str) -> str:
         config = self._collect_config()
         return config.site_a_url if site == "A" else config.site_b_url
-
-    def _close_source_page(self, site: str, page_a, page_b) -> None:
-        page = self._page_for_site(site, page_a, page_b)
-        if page is None or page.is_closed():
-            return
-        self.browser.close_page(page)
-
-    @staticmethod
-    def _deactivate_source(site: str, page_a, page_b) -> None:
-        page = OBSMatchRecorderApp._page_for_site(site, page_a, page_b)
-        if page is None or page.is_closed():
-            return
-        adapter_for(site, page).deactivate()
-
-    @staticmethod
-    def _page_for_site(site: str, page_a, page_b):
-        return page_a if site == "A" else page_b
-
-    def _activate_source(self, site: str, page_a, page_b) -> PlayerState:
-        page = self._page_for_site(site, page_a, page_b)
-
-        for other_site in ("A", "B"):
-            if other_site == site:
-                continue
-            other_page = self._page_for_site(other_site, page_a, page_b)
-            if other_page is not None and not other_page.is_closed():
-                adapter_for(other_site, other_page).deactivate()
-
-        page.bring_to_front()
-
-        last_state: PlayerState | None = None
-        for _ in range(3):
-            state = adapter_for(site, page).prepare(activate=True)
-            last_state = state
-            if state.ready_for_recording:
-                if not self.browser.ensure_foreground_and_fullscreen(page):
-                    raise PlayerControlError(
-                        "Chrome 窗口未能置前并进入浏览器全屏。"
-                    )
-                return adapter_for(site, page).inspect()
-
-        raise PlayerControlError(
-            f"网站 {site} 未达到录制条件："
-            f"播放={last_state.playing if last_state else False}，"
-            f"静音={last_state.muted if last_state else True}，"
-            f"全屏={last_state.fullscreen if last_state else False}。"
-        )
-
-    def _activate_first_ready_source(
-        self,
-        preferred_site: str,
-        page_a,
-        page_b,
-        status_a,
-        status_b,
-    ):
-        order = [preferred_site, "B" if preferred_site == "A" else "A"]
-        statuses = {"A": status_a, "B": status_b}
-        errors: list[str] = []
-
-        for site in order:
-            if site != preferred_site and not SourceMonitor._is_playing(statuses[site]):
-                continue
-            try:
-                state = self._activate_source(site, page_a, page_b)
-                return statuses[site], state
-            except PlayerControlError as error:
-                errors.append(f"网站 {site}：{error}")
-
-        raise PlayerControlError(
-            "首选源和备用源都未达到录制条件。\n" + "\n".join(errors)
-        )
-
-    @staticmethod
-    def _validate_sites(
-        config: AppConfig,
-    ) -> list[str]:
-        errors: list[str] = []
-
-        for label, address in (
-            ("网站 A", config.site_a_url),
-            ("网站 B", config.site_b_url),
-        ):
-            if label == "网站 B" and not address:
-                continue
-
-            parsed = urlparse(address)
-
-            if (
-                parsed.scheme not in {"http", "https"}
-                or not parsed.netloc
-            ):
-                errors.append(
-                    f"{label} URL 应以 "
-                    "http:// 或 https:// 开头。"
-                )
-
-        return errors
-
-    @staticmethod
-    def _validate_config(
-        config: AppConfig,
-    ) -> list[str]:
-        errors: list[str] = []
-
-        if not config.match_name:
-            errors.append(
-                "请填写比赛名称。"
-            )
-
-        try:
-            datetime.strptime(
-                config.match_start_time,
-                TIME_FORMAT,
-            )
-        except ValueError:
-            errors.append(
-                "比赛开始时间格式应为 "
-                "YYYY-MM-DD HH:MM。"
-            )
-
-        try:
-            if int(
-                config.advance_start_minutes
-            ) < 0:
-                raise ValueError
-
-        except ValueError:
-            errors.append(
-                "提前启动时间应为不小于 "
-                "0 的整数分钟。"
-            )
-
-        try:
-            if int(config.max_recording_minutes) <= 0:
-                raise ValueError
-
-        except ValueError:
-            errors.append(
-                "最大录制时长应为大于 0 的整数分钟。"
-            )
-
-        errors.extend(
-            OBSMatchRecorderApp._validate_sites(
-                config
-            )
-        )
-
-        if not config.obs_recording_directory:
-            errors.append(
-                "请选择 OBS 录制目录。"
-            )
-
-        elif not Path(
-            config.obs_recording_directory
-        ).is_dir():
-            errors.append(
-                "OBS 录制目录不存在或不可访问。"
-            )
-
-        return errors
-
-    @staticmethod
-    def _validate_obs_connection(
-        config: AppConfig,
-    ) -> list[str]:
-        errors: list[str] = []
-
-        if not config.obs_host:
-            errors.append(
-                "请填写 OBS WebSocket 地址。"
-            )
-
-        try:
-            port = int(config.obs_port)
-
-            if not 1 <= port <= 65535:
-                raise ValueError
-
-        except ValueError:
-            errors.append(
-                "OBS WebSocket 端口应为 "
-                "1 到 65535 的整数。"
-            )
-
-        return errors
-
-    @staticmethod
-    def _connection_from_config(
-        config: AppConfig,
-    ) -> OBSConnection:
-        return OBSConnection(
-            host=config.obs_host,
-            port=int(config.obs_port),
-            password=config.obs_password,
-        )
-
-    # =========================================================
-    # 日志
-    # =========================================================
 
     def _safe_log(self, message: str) -> None:
         """线程安全的日志：把日志投递到主线程再写入界面。
@@ -1695,13 +996,7 @@ class OBSMatchRecorderApp:
 
         self._cancel_recording_timer()
 
-        self._invalidate_monitor_loop()
-
-        if self.source_monitor is not None:
-            try:
-                self.source_monitor.stop()
-            except Exception:
-                pass
+        self.sources.close()
 
         try:
             self.browser.close()

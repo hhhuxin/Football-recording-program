@@ -29,7 +29,7 @@ from .source_manager import SourceManager
 class OBSMatchRecorderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("OBS 比赛录制助手 V0.2")
+        self.root.title("OBS 比赛录制助手 V1.1")
         self.root.minsize(820, 700)
 
         self.root.columnconfigure(0, weight=1)

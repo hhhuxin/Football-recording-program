@@ -61,7 +61,20 @@ class PlayerAdapter:
             """
             async (video, args) => {
                 const {activate, pause} = args;
-                video.volume = activate ? 1 : 0;
+                const videos = [...document.querySelectorAll('video')];
+                videos.forEach(item => {
+                    if (item !== video) {
+                        item.pause();
+                        item.muted = true;
+                        item.volume = 0;
+                    }
+                });
+                document.querySelectorAll('audio').forEach(item => {
+                    item.pause();
+                    item.muted = true;
+                    item.volume = 0;
+                });
+                video.volume = activate ? Math.max(video.volume, 0.5) : 0;
                 video.muted = !activate;
                 if (pause) {
                     video.pause();
@@ -118,7 +131,20 @@ class PlayerAdapter:
         selector = getattr(self, "VIDEO_SELECTOR", "video")
         if not self.page.locator(selector).count():
             return
-        self._evaluate_video(False, pause=True)
+        self.page.locator(selector).evaluate_all(
+            """
+            videos => videos.forEach(video => {
+                video.pause();
+                video.muted = true;
+                video.volume = 0;
+            })
+            """
+        )
+
+    def ensure_active(self) -> PlayerState:
+        """修复当前源被网页重新静音或暂停后的状态。"""
+
+        return self.prepare(activate=True)
 
     def _wait_for_video(self, selector: str, timeout: int = 15000) -> bool:
         try:
@@ -158,6 +184,95 @@ class PlayerAdapter:
             """,
             selector,
         )
+
+    def _is_player_fullscreen(self) -> bool:
+        return bool(
+            self.page.evaluate(
+                """
+                selector => {
+                    if (document.fullscreenElement) return true;
+                    const player = document.querySelector(selector);
+                    if (!player) return false;
+                    const rect = player.getBoundingClientRect();
+                    return rect.width >= innerWidth * .95 &&
+                        rect.height >= innerHeight * .90;
+                }
+                """,
+                self.PLAYER_SELECTOR,
+            )
+        )
+
+    def _normalize_fullscreen_layout(self) -> None:
+        """同步播放器容器尺寸，避免全屏后视频只占窗口上半部分。"""
+
+        try:
+            self.page.evaluate(
+                """
+                selector => {
+                    const player = document.querySelector(selector);
+                    const fullscreen = document.fullscreenElement;
+                    if (!player && !fullscreen) return false;
+
+                    const root = fullscreen || player;
+                    const important = (element, property, value) =>
+                        element.style.setProperty(property, value, 'important');
+
+                    important(root, 'position', 'fixed');
+                    important(root, 'inset', '0');
+                    important(root, 'width', '100vw');
+                    important(root, 'height', '100vh');
+                    important(root, 'max-width', 'none');
+                    important(root, 'max-height', 'none');
+                    important(root, 'overflow', 'hidden');
+
+                    const wrapper = root.querySelector(
+                        '.video-wrapper, .video-content, #video'
+                    );
+                    if (wrapper) {
+                        important(wrapper, 'width', '100%');
+                        important(wrapper, 'height', '100%');
+                    }
+
+                    const video = root.querySelector('video');
+                    if (video) {
+                        important(video, 'width', '100%');
+                        important(video, 'height', '100%');
+                        important(video, 'object-fit', 'contain');
+                    }
+
+                    document.body.style.overflow = 'hidden';
+                    window.dispatchEvent(new Event('resize'));
+                    return true;
+                }
+                """,
+                self.PLAYER_SELECTOR,
+            )
+        except Exception:
+            pass
+
+    def _close_quality_menu(self) -> None:
+        """画质切换完成后关闭菜单，避免遮挡录制画面。"""
+
+        menu = self.page.locator(".ratetype-content")
+        if not menu.count():
+            return
+        try:
+            if not menu.first.is_visible(timeout=300):
+                return
+        except Exception:
+            return
+
+        self._click_first([".ratetype"], timeout=800)
+        try:
+            if menu.first.is_visible(timeout=300):
+                self.page.evaluate(
+                    """
+                    () => document.querySelectorAll('.ratetype-content')
+                        .forEach(menu => menu.classList.add('none'))
+                    """
+                )
+        except Exception:
+            pass
 
     def _state(self, selector: str, quality: str = "", danmaku_disabled: bool = False) -> PlayerState:
         video_selector = getattr(self, "VIDEO_SELECTOR", "video")
@@ -211,6 +326,7 @@ class MiguPlayerAdapter(PlayerAdapter):
         if not video.count():
             raise PlayerControlError("咪咕页面没有找到 #m-player 视频。")
 
+        self._dismiss_qrcode()
         self._evaluate_video(activate, pause=not activate)
 
         # 参考页面的控制结构：画质菜单中第一个可见项是当前账号可选择的最高档。
@@ -227,12 +343,17 @@ class MiguPlayerAdapter(PlayerAdapter):
                 except Exception:
                     continue
 
+        self._close_quality_menu()
+
         if activate:
-            fullscreen_requested = self._click_first(
-                [".zoom-btn", ".zoom-btn .btn-bg", "[title='全屏']"]
-            )
-            if not fullscreen_requested:
-                self._request_fullscreen(self.PLAYER_SELECTOR)
+            if not self._is_player_fullscreen():
+                fullscreen_requested = self._click_first(
+                    [".zoom-btn .btn-bg[title='全屏']", "[title='全屏']"]
+                )
+                if not fullscreen_requested:
+                    self._request_fullscreen(self.PLAYER_SELECTOR)
+                self.page.wait_for_timeout(250)
+            self._normalize_fullscreen_layout()
 
         if activate:
             self._activate_video(self.PLAY_SELECTORS)
@@ -242,7 +363,35 @@ class MiguPlayerAdapter(PlayerAdapter):
     def inspect(self) -> PlayerState:
         if not self.page.locator(self.VIDEO_SELECTOR).count():
             return PlayerState(self.site, False, False, True, False, 0, 0)
+        self._dismiss_qrcode()
         return self._state(self.PLAYER_SELECTOR)
+
+    def _dismiss_qrcode(self) -> bool:
+        """关闭咪咕播放器中央的手机客户端下载二维码。"""
+
+        overlay = self.page.locator(".qrcode-container")
+        if not overlay.count():
+            return False
+        try:
+            if not overlay.first.is_visible(timeout=300):
+                return False
+        except Exception:
+            return False
+
+        close_button = overlay.first.locator(".qr-close")
+        try:
+            if close_button.count() and close_button.first.is_visible(timeout=300):
+                close_button.first.click(force=True, timeout=1000)
+        except Exception:
+            pass
+        try:
+            if overlay.first.is_visible(timeout=300):
+                overlay.first.evaluate(
+                    "element => { element.style.display = 'none'; }"
+                )
+        except Exception:
+            pass
+        return True
 
 
 class FeisuPlayerAdapter(PlayerAdapter):
@@ -309,11 +458,14 @@ class FeisuPlayerAdapter(PlayerAdapter):
         self._evaluate_video(activate, pause=not activate)
 
         if activate:
-            fullscreen_requested = self._click_first(
-                ["#video .dplayer-full-icon", ".dplayer-full-icon"]
-            )
-            if not fullscreen_requested:
-                self._request_fullscreen(self.PLAYER_SELECTOR)
+            if not self._is_player_fullscreen():
+                fullscreen_requested = self._click_first(
+                    ["#video .dplayer-full-icon", ".dplayer-full-icon"]
+                )
+                if not fullscreen_requested:
+                    self._request_fullscreen(self.PLAYER_SELECTOR)
+                self.page.wait_for_timeout(250)
+            self._normalize_fullscreen_layout()
 
         if activate:
             self._dismiss_mute_overlay()

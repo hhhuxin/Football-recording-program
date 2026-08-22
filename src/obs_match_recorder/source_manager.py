@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from typing import Callable
+from urllib.parse import urlparse
 
 from playwright.sync_api import Page
 
@@ -82,6 +83,11 @@ class SourceManager:
             except Exception:
                 pass
 
+        if self.current_site is not None:
+            page = self._page_for_site(self.current_site)
+            if page is not None and not page.is_closed():
+                self.browser.restore_cursor(page)
+
     def close(self) -> None:
         """关闭所有页面与监控（程序退出时调用）。"""
 
@@ -93,6 +99,11 @@ class SourceManager:
                 self.source_monitor.stop()
             except Exception:
                 pass
+
+        if self.current_site is not None:
+            page = self._page_for_site(self.current_site)
+            if page is not None and not page.is_closed():
+                self.browser.restore_cursor(page)
 
     # =========================================================
     # 页面操作
@@ -112,7 +123,42 @@ class SourceManager:
             if site_b_url.strip()
             else None
         )
+        self.browser.close_unexpected_pages(
+            [self.page_a, self.page_b],
+            self._allowed_hosts(site_a_url, site_b_url),
+        )
         return self.page_a, self.page_b
+
+    @staticmethod
+    def _allowed_hosts(*urls: str) -> set[str]:
+        return {
+            parsed.hostname
+            for parsed in (urlparse(url) for url in urls)
+            if parsed.hostname
+        }
+
+    def _stabilize_active_source(
+        self,
+        site: str,
+        page: Page,
+    ) -> PlayerState:
+        """保证当前页独占媒体、没有外部弹窗并保持前台播放。"""
+
+        state = adapter_for(site, page).ensure_active()
+        self.browser.silence_other_pages(page)
+        self.browser.close_unexpected_pages(
+            [self.page_a, self.page_b, page],
+            self._allowed_hosts(
+                self._url_for_site("A"),
+                self._url_for_site("B"),
+            ),
+        )
+        if not self.browser.ensure_foreground_and_fullscreen(page):
+            raise PlayerControlError(
+                "Chrome 窗口未能置前并进入浏览器全屏。"
+            )
+        self.browser.hide_cursor(page)
+        return adapter_for(site, page).inspect()
 
     def prepare_backup_page(self, site: str, page: Page | None) -> None:
         """准备备用页，但不抢占当前浏览器焦点，也不打开声音。"""
@@ -130,6 +176,7 @@ class SourceManager:
         """串行唤醒并检测单个来源，确保另一个来源不会同时出声。"""
 
         page.bring_to_front()
+        self.browser.silence_other_pages(page)
         try:
             adapter_for(site, page).prepare(activate=True)
         except PlayerControlError:
@@ -213,6 +260,8 @@ class SourceManager:
         """激活指定源：停用另一源、置前、播放、最高画质、全屏。"""
 
         page = self._page_for_site(site)
+        if page is None or page.is_closed():
+            raise PlayerControlError(f"网站 {site} 页面不存在或已经关闭。")
 
         for other_site in ("A", "B"):
             if other_site == site:
@@ -222,17 +271,21 @@ class SourceManager:
                 adapter_for(other_site, other_page).deactivate()
 
         page.bring_to_front()
+        self.browser.silence_other_pages(page)
+        self.browser.close_unexpected_pages(
+            [self.page_a, self.page_b, page],
+            self._allowed_hosts(
+                self._url_for_site("A"),
+                self._url_for_site("B"),
+            ),
+        )
 
         last_state: PlayerState | None = None
         for _ in range(3):
             state = adapter_for(site, page).prepare(activate=True)
             last_state = state
             if state.ready_for_recording:
-                if not self.browser.ensure_foreground_and_fullscreen(page):
-                    raise PlayerControlError(
-                        "Chrome 窗口未能置前并进入浏览器全屏。"
-                    )
-                return adapter_for(site, page).inspect()
+                return self._stabilize_active_source(site, page)
 
         raise PlayerControlError(
             f"网站 {site} 未达到录制条件："
@@ -348,7 +401,8 @@ class SourceManager:
             status_b,
         )
 
-        self.close_source_page("B" if selected.name == "A" else "A")
+        # 保留备用页供 SourceMonitor 继续检测；它已被静音/暂停，不能产生第二路声音。
+        self.deactivate_source("B" if selected.name == "A" else "A")
 
         monitor.current_site = selected.name
 
@@ -406,6 +460,10 @@ class SourceManager:
         monitor = self.source_monitor
 
         def work():
+            if self.current_site is not None:
+                page = self._page_for_site(self.current_site)
+                if page is not None and not page.is_closed():
+                    self._stabilize_active_source(self.current_site, page)
             return monitor.detect_once()
 
         self._run_in_background(
@@ -588,7 +646,8 @@ class SourceManager:
         player_state = self.activate_source(site)
 
         if old_source is not None:
-            self.close_source_page(old_source)
+            # 旧页保留给 SourceMonitor 探测，保持暂停静音即可，不能关闭后继续用失效引用检测。
+            self.deactivate_source(old_source)
 
         return player_state
 

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import socket
 import os
+import socket
 import re
 import subprocess
 import time
+import ctypes
 from ctypes import WINFUNCTYPE, byref, c_bool, windll
 from ctypes import wintypes
 from pathlib import Path
@@ -78,6 +79,73 @@ class BrowserController:
                 f'--user-data-dir="{profile}"'
             ) from error
 
+    def _is_cdp_ready(self) -> bool:
+        """检查 CDP 的 HTTP 接口，避免只检查 TCP 后连接到失效实例。"""
+
+        parsed = urlparse(self.cdp_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 9222
+        try:
+            with socket.create_connection((host, port), timeout=1.5) as connection:
+                connection.sendall(
+                    f"GET /json/version HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                    "Connection: close\r\n\r\n".encode("ascii")
+                )
+                response = connection.recv(4096).decode("utf-8", "ignore")
+            return "200" in response.splitlines()[0] and "webSocketDebuggerUrl" in response
+        except (OSError, IndexError):
+            return False
+
+    def _start_debug_chrome(self) -> None:
+        """没有 CDP 时自动启动项目专用 Chrome。"""
+
+        chrome = self._chrome_executable()
+        if chrome is None:
+            self._check_cdp_port()
+            return
+
+        parsed = urlparse(self.cdp_url)
+        port = parsed.port or 9222
+        profile = self._profile_directory()
+        profile.mkdir(parents=True, exist_ok=True)
+
+        try:
+            subprocess.Popen(
+                [
+                    str(chrome),
+                    f"--remote-debugging-port={port}",
+                    f"--user-data-dir={profile}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+                cwd=str(profile),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    if os.name == "nt"
+                    else 0
+                ),
+            )
+        except OSError as error:
+            raise BrowserControllerError(f"无法自动启动 Chrome：{error}") from error
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if self._is_cdp_ready():
+                return
+            time.sleep(0.25)
+
+        raise BrowserControllerError(
+            "Chrome 已尝试启动，但远程调试接口仍未就绪。"
+            "请确认项目专用 Chrome 窗口已打开。"
+        )
+
+    def _ensure_cdp_ready(self) -> None:
+        if not self._is_cdp_ready():
+            self._start_debug_chrome()
+
     def _debug_browser_pid(self) -> int | None:
         parsed = urlparse(self.cdp_url)
         host = parsed.hostname or "127.0.0.1"
@@ -127,8 +195,6 @@ class BrowserController:
                 hwnd_found.value = hwnd
                 return False
             return True
-
-        import ctypes
 
         user32.EnumWindows(find_chrome_window, 0)
         hwnd = hwnd_found.value
@@ -187,10 +253,16 @@ class BrowserController:
 
     def start(self) -> None:
         if self._context is not None:
-            return
+            try:
+                if not self._context.pages:
+                    self.close()
+                else:
+                    return
+            except Exception:
+                self.close()
 
         try:
-            self._check_cdp_port()
+            self._ensure_cdp_ready()
             self._playwright = sync_playwright().start()
 
             browser = self._playwright.chromium.connect_over_cdp(
@@ -217,23 +289,26 @@ class BrowserController:
                 "Chrome 尚未连接。"
             )
 
-        try:
-            page = self._context.new_page()
+        for attempt in range(2):
+            try:
+                page = self._context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                self._managed_pages.append(page)
+                return page
+            except Exception as error:
+                target_closed = "target page, context or browser has been closed" in str(error).lower()
+                if attempt == 0 and target_closed:
+                    self.close()
+                    try:
+                        self.start()
+                    except Exception:
+                        raise BrowserControllerError(
+                            f"无法打开网页：{url}\n{error}"
+                        ) from error
+                    continue
+                raise BrowserControllerError(f"无法打开网页：{url}\n{error}") from error
 
-            page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-
-            self._managed_pages.append(page)
-
-            return page
-
-        except Exception as error:
-            raise BrowserControllerError(
-                f"无法打开网页：{url}\n{error}"
-            ) from error
+        raise BrowserControllerError(f"无法打开网页：{url}")
 
     def open_sites(
         self,
@@ -267,6 +342,99 @@ class BrowserController:
                 managed for managed in self._managed_pages
                 if managed is not page
             ]
+
+    @staticmethod
+    def hide_cursor(page: Page) -> None:
+        """隐藏播放器区域的页面光标，并把系统鼠标移到左侧一次。"""
+
+        try:
+            page.evaluate(
+                """
+                () => {
+                    const player = document.querySelector(
+                        '#mod-player, .video-wrapper, #sport-live, #video, .dplayer'
+                    );
+                    if (player) player.style.cursor = 'none';
+                }
+                """
+            )
+        except Exception:
+            pass
+
+        if os.name == "nt":
+            try:
+                screen_height = windll.user32.GetSystemMetrics(1)
+                windll.user32.SetCursorPos(1, max(1, screen_height // 2))
+            except Exception:
+                pass
+
+    @staticmethod
+    def restore_cursor(page: Page) -> None:
+        """任务结束后恢复页面的正常鼠标样式。"""
+
+        try:
+            page.evaluate(
+                """
+                () => {
+                    document.documentElement.style.cursor = '';
+                    document.body.style.cursor = '';
+                    document.querySelectorAll(
+                        '#mod-player, .video-wrapper, #sport-live, #video, .dplayer'
+                    ).forEach(player => player.style.cursor = '');
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def silence_other_pages(self, active_page: Page) -> None:
+        """暂停并静音其它标签页中的媒体，避免录制时出现重音。"""
+
+        if self._context is None:
+            return
+        for page in self._context.pages:
+            if page is active_page or page.is_closed():
+                continue
+            try:
+                page.evaluate(
+                    """
+                    () => document.querySelectorAll('video, audio').forEach(media => {
+                        media.pause();
+                        media.muted = true;
+                        media.volume = 0;
+                    })
+                    """
+                )
+            except Exception:
+                pass
+
+    def close_unexpected_pages(
+        self,
+        keep_pages: list[Page | None],
+        allowed_hosts: set[str],
+    ) -> None:
+        """关闭重复直播页和广告弹出的外部标签页。"""
+
+        if self._context is None:
+            return
+        keep_pages = [page for page in keep_pages if page is not None]
+        keep_ids = {id(page) for page in keep_pages}
+        keep_urls = {
+            page.url for page in keep_pages if not page.is_closed()
+        }
+        for page in self._context.pages:
+            if page.is_closed() or id(page) in keep_ids:
+                continue
+            try:
+                parsed = urlparse(page.url)
+                if parsed.scheme in {"chrome", "devtools"}:
+                    continue
+                if page.url in keep_urls or (
+                    parsed.hostname and parsed.hostname not in allowed_hosts
+                ):
+                    page.close()
+            except Exception:
+                pass
 
     def close(self) -> None:
         self.close_managed_pages()

@@ -45,7 +45,9 @@ class BrowserController:
 
     @staticmethod
     def _profile_directory() -> Path:
-        return Path(__file__).resolve().parent.parent / "ChromeRecorderProfile"
+        # 项目根目录（src 布局下：browser.py 位于 <根>/src/obs_match_recorder/）
+        project_root = Path(__file__).resolve().parent.parent.parent
+        return project_root / "ChromeRecorderProfile"
 
     def _check_cdp_port(self) -> None:
         """给出比 Playwright 原始 ECONNREFUSED 更可执行的提示。"""

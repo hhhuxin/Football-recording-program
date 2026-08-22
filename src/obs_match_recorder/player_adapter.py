@@ -217,6 +217,69 @@ class PlayerAdapter:
                     const important = (element, property, value) =>
                         element.style.setProperty(property, value, 'important');
 
+                    let style = document.getElementById(
+                        'obs-match-recorder-fullscreen-layout'
+                    );
+                    if (!style) {
+                        style = document.createElement('style');
+                        style.id = 'obs-match-recorder-fullscreen-layout';
+                        document.head.appendChild(style);
+                    }
+                    style.textContent = `
+                        html, body {
+                            width: 100% !important;
+                            height: 100% !important;
+                            margin: 0 !important;
+                            overflow: hidden !important;
+                            background: #000 !important;
+                        }
+                        #sport-live, #mod-player, #video, #video.dplayer, .dplayer {
+                            position: fixed !important;
+                            inset: 0 !important;
+                            width: 100vw !important;
+                            height: 100vh !important;
+                            min-width: 100vw !important;
+                            min-height: 100vh !important;
+                            max-width: none !important;
+                            max-height: none !important;
+                            margin: 0 !important;
+                            padding: 0 !important;
+                            overflow: hidden !important;
+                        }
+                        #mod-player .video-wrapper,
+                        #mod-player .mg_player_wrapper,
+                        #video .dplayer-video-wrap,
+                        #m-player,
+                        #video video,
+                        .dplayer video {
+                            position: absolute !important;
+                            inset: 0 !important;
+                            width: 100% !important;
+                            height: 100% !important;
+                            min-width: 100% !important;
+                            min-height: 100% !important;
+                            max-width: none !important;
+                            max-height: none !important;
+                        }
+                        #m-player, #video video, .dplayer video {
+                            object-fit: contain !important;
+                            background: #000 !important;
+                        }
+                        #mod-player .adver-box,
+                        #mod-player .video-vr,
+                        #mod-player .player-tips,
+                        #video .dplayer-controller,
+                        #video .dplayer-mask {
+                            position: absolute !important;
+                            left: 0 !important;
+                            right: 0 !important;
+                            width: 100% !important;
+                        }
+                        #mod-player .control-wrapper {
+                            bottom: 0 !important;
+                        }
+                    `;
+
                     important(root, 'position', 'fixed');
                     important(root, 'inset', '0');
                     important(root, 'width', '100vw');
@@ -240,7 +303,8 @@ class PlayerAdapter:
                         important(video, 'object-fit', 'contain');
                     }
 
-                    document.body.style.overflow = 'hidden';
+                    important(document.documentElement, 'overflow', 'hidden');
+                    important(document.body, 'overflow', 'hidden');
                     window.dispatchEvent(new Event('resize'));
                     return true;
                 }
@@ -357,6 +421,7 @@ class MiguPlayerAdapter(PlayerAdapter):
 
         if activate:
             self._activate_video(self.PLAY_SELECTORS)
+            self._normalize_fullscreen_layout()
 
         return self._state(self.PLAYER_SELECTOR, quality=quality)
 
@@ -470,6 +535,7 @@ class FeisuPlayerAdapter(PlayerAdapter):
         if activate:
             self._dismiss_mute_overlay()
             self._activate_video(self.PLAY_SELECTORS)
+            self._normalize_fullscreen_layout()
 
         return self._state(
             self.PLAYER_SELECTOR,

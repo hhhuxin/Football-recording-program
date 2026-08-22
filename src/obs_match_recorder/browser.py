@@ -345,16 +345,31 @@ class BrowserController:
 
     @staticmethod
     def hide_cursor(page: Page) -> None:
-        """隐藏播放器区域的页面光标，并把系统鼠标移到左侧一次。"""
+        """隐藏网页中的鼠标光标，并把系统鼠标移到左上角一次。"""
 
         try:
             page.evaluate(
                 """
                 () => {
-                    const player = document.querySelector(
-                        '#mod-player, .video-wrapper, #sport-live, #video, .dplayer'
+                    let style = document.getElementById(
+                        'obs-match-recorder-cursor-style'
                     );
-                    if (player) player.style.cursor = 'none';
+                    if (!style) {
+                        style = document.createElement('style');
+                        style.id = 'obs-match-recorder-cursor-style';
+                        document.head.appendChild(style);
+                    }
+                    style.textContent = `
+                        *, *::before, *::after {
+                            cursor: none !important;
+                        }
+                    `;
+                    document.documentElement.style.setProperty(
+                        'cursor', 'none', 'important'
+                    );
+                    document.body.style.setProperty(
+                        'cursor', 'none', 'important'
+                    );
                 }
                 """
             )
@@ -363,8 +378,7 @@ class BrowserController:
 
         if os.name == "nt":
             try:
-                screen_height = windll.user32.GetSystemMetrics(1)
-                windll.user32.SetCursorPos(1, max(1, screen_height // 2))
+                windll.user32.SetCursorPos(1, 1)
             except Exception:
                 pass
 
@@ -376,11 +390,11 @@ class BrowserController:
             page.evaluate(
                 """
                 () => {
-                    document.documentElement.style.cursor = '';
-                    document.body.style.cursor = '';
-                    document.querySelectorAll(
-                        '#mod-player, .video-wrapper, #sport-live, #video, .dplayer'
-                    ).forEach(player => player.style.cursor = '');
+                    document.getElementById(
+                        'obs-match-recorder-cursor-style'
+                    )?.remove();
+                    document.documentElement.style.removeProperty('cursor');
+                    document.body.style.removeProperty('cursor');
                 }
                 """
             )

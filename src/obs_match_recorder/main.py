@@ -774,6 +774,10 @@ class OBSMatchRecorderApp:
             "OBS 录制已开始。"
             "正在持续监控直播源。"
         )
+        self.log(
+            "录音设置：已自动静音 OBS 麦克风输入，"
+            "保留桌面音频用于录制直播声音。"
+        )
 
         config = self._collect_config()
         duration_minutes = int(config.max_recording_minutes)

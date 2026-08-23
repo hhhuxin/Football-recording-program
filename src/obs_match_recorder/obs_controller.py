@@ -88,6 +88,7 @@ class OBSController:
         client = self._client()
 
         try:
+            self._mute_microphone_inputs(client)
             status = client.get_record_status()
 
             if status.output_active:
@@ -104,6 +105,32 @@ class OBSController:
             raise OBSControllerError(
                 f"无法开始 OBS 录制：{error}"
             ) from error
+
+    @staticmethod
+    def _mute_microphone_inputs(client) -> list[str]:
+        """录制比赛时关闭 OBS 中的麦克风输入，避免混入环境底噪。"""
+
+        muted_names: list[str] = []
+        try:
+            inputs = client.get_input_list().inputs
+        except Exception:
+            return muted_names
+
+        for item in inputs:
+            if item.get("inputKind") != "wasapi_input_capture":
+                continue
+
+            name = item.get("inputName")
+            if not name:
+                continue
+
+            try:
+                client.set_input_mute(name, True)
+                muted_names.append(name)
+            except Exception:
+                continue
+
+        return muted_names
 
     def stop_recording(self) -> bool:
         """停止 OBS 当前录制。"""

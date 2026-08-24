@@ -150,3 +150,14 @@ class OBSController:
             raise OBSControllerError(
                 f"无法停止 OBS 录制：{error}"
             ) from error
+
+    def is_recording(self) -> bool:
+        """读取 OBS 当前是否仍在录制。"""
+
+        client = self._client()
+        try:
+            return bool(client.get_record_status().output_active)
+        except Exception as error:
+            raise OBSControllerError(
+                f"无法读取 OBS 录制状态：{error}"
+            ) from error

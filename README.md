@@ -23,7 +23,6 @@ Windows 桌面程序：无人值守自动录制足球比赛直播。
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 ```
 
 ## 快速开始
@@ -51,7 +50,7 @@ Football-recording-program/
 ├── src/                       # 源码（src 布局）
 │   └── obs_match_recorder/
 │       ├── main.py            # Tkinter GUI 主程序
-│       ├── browser.py         # Playwright 连接调试 Chrome
+│       ├── browser.py         # 启动并通过 CDP 连接项目专用 Chrome
 │       ├── detector.py        # 直播状态检测（多信号评分）
 │       ├── monitor.py         # 持续监控与卡顿判断、选源
 │       ├── player_adapter.py  # 咪咕 / 飞速播放器控制

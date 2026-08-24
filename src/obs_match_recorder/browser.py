@@ -1,4 +1,4 @@
-"""Playwright 浏览器管理。"""
+"""通过 CDP 管理项目专用 Chrome 浏览器。"""
 
 from __future__ import annotations
 
@@ -34,15 +34,24 @@ class BrowserController:
 
     @staticmethod
     def _chrome_executable() -> Path | None:
+        # 本机使用用户目录安装的 Chrome。优先使用这个完整路径，避免
+        # 同时安装多个 Chrome 时误启动 Program Files 下的另一个实例。
+        explicit_path = Path(
+            r"C:\Users\Administrator\AppData\Local\Google\Chrome\Application\chrome.exe"
+        )
         candidates = [
+            explicit_path,
+            Path(os.environ.get("LOCALAPPDATA", ""))
+            / "Google/Chrome/Application/chrome.exe",
             Path(os.environ.get("ProgramFiles", ""))
             / "Google/Chrome/Application/chrome.exe",
             Path(os.environ.get("ProgramFiles(x86)", ""))
             / "Google/Chrome/Application/chrome.exe",
-            Path(os.environ.get("LOCALAPPDATA", ""))
-            / "Google/Chrome/Application/chrome.exe",
         ]
-        return next((path for path in candidates if path.is_file()), None)
+        for path in candidates:
+            if path.is_file():
+                return path
+        return None
 
     @staticmethod
     def _profile_directory() -> Path:
@@ -51,7 +60,7 @@ class BrowserController:
         return project_root / "ChromeRecorderProfile"
 
     def _check_cdp_port(self) -> None:
-        """给出比 Playwright 原始 ECONNREFUSED 更可执行的提示。"""
+        """给出比底层连接错误更可执行的提示。"""
 
         parsed = urlparse(self.cdp_url)
         host = parsed.hostname or "127.0.0.1"
@@ -70,7 +79,7 @@ class BrowserController:
             profile = BrowserController._profile_directory()
             raise BrowserControllerError(
                 f"Chrome 远程调试端口未开启：{host}:{port}。\n"
-                "当前普通 Chrome 不能被 Playwright 接管。请完全退出 Chrome，"
+                "当前普通 Chrome 不能通过远程调试接管。请完全退出 Chrome，"
                 "双击项目目录中的 start_chrome_debug.bat，"
                 "然后在新窗口登录咪咕和飞速。\n"
                 "等新 Chrome 打开后再点击“测试浏览器”。\n"
@@ -263,6 +272,9 @@ class BrowserController:
 
         try:
             self._ensure_cdp_ready()
+            # 这里不会 launch Playwright 自带 Chromium。
+            # Chrome 进程由 _start_debug_chrome() 使用 chrome.exe 启动，
+            # Playwright 只作为 CDP 控制桥接连接到现有 Chrome。
             self._playwright = sync_playwright().start()
 
             browser = self._playwright.chromium.connect_over_cdp(
@@ -461,3 +473,32 @@ class BrowserController:
                 pass
 
         self._playwright = None
+
+    def restart(self) -> None:
+        """关闭并重启项目专用 Chrome，保留原有登录配置。"""
+
+        pid = self._debug_browser_pid()
+        self.close()
+
+        if os.name == "nt" and pid is not None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise BrowserControllerError(
+                    f"无法关闭项目专用 Chrome（PID {pid}）：{error}"
+                ) from error
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if self._debug_browser_pid() is None:
+                    break
+                time.sleep(0.25)
+
+        self._start_debug_chrome()
+        self.start()

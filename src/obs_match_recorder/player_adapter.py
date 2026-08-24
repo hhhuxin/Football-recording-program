@@ -37,6 +37,9 @@ class PlayerState:
 
 class PlayerAdapter:
     site = "?"
+    PAGE_SETTLE_MS = 1200
+    FULLSCREEN_SETTLE_MS = 1500
+    PLAYBACK_SETTLE_MS = 1000
     PLAY_SELECTORS: list[str] = [
         "[aria-label='播放']",
         "[aria-label='Play']",
@@ -49,7 +52,11 @@ class PlayerAdapter:
     def __init__(self, page: Page) -> None:
         self.page = page
 
-    def prepare(self, activate: bool = False) -> PlayerState:
+    def prepare(
+        self,
+        activate: bool = False,
+        quality_fallback_steps: int = 0,
+    ) -> PlayerState:
         raise NotImplementedError
 
     def inspect(self) -> PlayerState:
@@ -57,41 +64,52 @@ class PlayerAdapter:
 
     def _evaluate_video(self, activate: bool, pause: bool = False) -> bool:
         selector = getattr(self, "VIDEO_SELECTOR", "video")
-        return bool(self.page.locator(selector).first.evaluate(
-            """
-            async (video, args) => {
-                const {activate, pause} = args;
-                const videos = [...document.querySelectorAll('video')];
-                videos.forEach(item => {
-                    if (item !== video) {
+        try:
+            return bool(self.page.locator(selector).first.evaluate(
+                """
+                async (video, args) => {
+                    const {activate, pause} = args;
+                    const videos = [...document.querySelectorAll('video')];
+                    videos.forEach(item => {
+                        if (item !== video) {
+                            item.pause();
+                            item.muted = true;
+                            item.volume = 0;
+                        }
+                    });
+                    document.querySelectorAll('audio').forEach(item => {
                         item.pause();
                         item.muted = true;
                         item.volume = 0;
+                    });
+                    video.volume = activate ? Math.max(video.volume, 0.5) : 0;
+                    video.muted = !activate;
+                    if (pause) {
+                        video.pause();
+                        return true;
                     }
-                });
-                document.querySelectorAll('audio').forEach(item => {
-                    item.pause();
-                    item.muted = true;
-                    item.volume = 0;
-                });
-                video.volume = activate ? Math.max(video.volume, 0.5) : 0;
-                video.muted = !activate;
-                if (pause) {
-                    video.pause();
-                    return true;
-                }
-                if (activate && (video.paused || video.ended)) {
-                    try {
-                        await video.play();
-                    } catch (_) {
-                        return false;
+                    if (activate && (video.paused || video.ended)) {
+                        // 部分咪咕页面的 play() Promise 可能一直 pending。
+                        // 这里只发起播放请求，不等待网页 Promise；下面的
+                        // _wait_for_playing() 会用明确超时检查真实播放状态。
+                        try {
+                            const pending = video.play();
+                            if (pending && typeof pending.catch === 'function') {
+                                pending.catch(() => {});
+                            }
+                        } catch (_) {
+                            return false;
+                        }
                     }
+                    return !activate || (!video.paused && !video.ended);
                 }
-                return !activate || (!video.paused && !video.ended);
-            }
-            """,
-            {"activate": activate, "pause": pause},
-        ))
+                """,
+                {"activate": activate, "pause": pause},
+                timeout=5000,
+            ))
+        except Exception:
+            # 页面仍在切换广告/播放器实例时，交给点击播放和状态轮询重试。
+            return False
 
     def _wait_for_playing(self, timeout: int = 5000) -> bool:
         selector = getattr(self, "VIDEO_SELECTOR", "video")
@@ -378,85 +396,235 @@ class MiguPlayerAdapter(PlayerAdapter):
 
     VIDEO_SELECTOR = "#m-player, video.m-player, video"
     PLAYER_SELECTOR = "#mod-player, .video-wrapper, #sport-live"
+    # 咪咕的“原画/下载 App”可能弹出二维码，固定使用菜单文字为“蓝光”的选项。
+    # data-val 只作为旧页面兼容回退，不能单独作为画质判断依据。
+    BLUE_QUALITY_FALLBACK_SELECTOR = ".ratetype-content .item-rt[data-val='4']"
     PLAY_SELECTORS = [
         "#mod-player .play-btn",
         ".m-player .play-btn",
         *PlayerAdapter.PLAY_SELECTORS,
     ]
 
-    def prepare(self, activate: bool = False) -> PlayerState:
+    def prepare(
+        self,
+        activate: bool = False,
+        quality_fallback_steps: int = 0,
+    ) -> PlayerState:
         self._wait_for_video(self.VIDEO_SELECTOR)
         video = self.page.locator(self.VIDEO_SELECTOR).first
         if not video.count():
             raise PlayerControlError("咪咕页面没有找到 #m-player 视频。")
 
+        # 咪咕播放器的 video 节点通常先于广告、控制栏和二维码弹窗出现。
+        # 给这些异步组件留出时间，避免后续全屏/播放操作连续撞在初始化阶段。
+        self.page.wait_for_timeout(self.PAGE_SETTLE_MS)
         self._dismiss_qrcode()
-        self._evaluate_video(activate, pause=not activate)
-
-        # 参考页面的控制结构：画质菜单中第一个可见项是当前账号可选择的最高档。
-        quality = ""
-        if self._click_first([".ratetype"]):
-            quality_items = self.page.locator(".ratetype-content .item-rt")
-            for index in range(quality_items.count()):
-                item = quality_items.nth(index)
-                try:
-                    if item.is_visible(timeout=500):
-                        quality = item.inner_text().strip()
-                        item.click(timeout=1200, force=True)
-                        break
-                except Exception:
-                    continue
-
-        self._close_quality_menu()
+        self._dismiss_ad_overlay()
 
         if activate:
+            # 先进入播放器全屏，再操作画质和播放，避免网页仍在普通布局时
+            # 同时触发多个播放器重排。
             if not self._is_player_fullscreen():
                 fullscreen_requested = self._click_first(
                     [".zoom-btn .btn-bg[title='全屏']", "[title='全屏']"]
                 )
                 if not fullscreen_requested:
                     self._request_fullscreen(self.PLAYER_SELECTOR)
-                self.page.wait_for_timeout(250)
+                self.page.wait_for_timeout(self.FULLSCREEN_SETTLE_MS)
             self._normalize_fullscreen_layout()
+            self._dismiss_qrcode()
+            self._dismiss_ad_overlay()
+        else:
+            self._evaluate_video(False, pause=True)
+
+        quality = self._select_blue_quality(quality_fallback_steps)
+        if activate and not quality:
+            self._close_quality_menu()
+            raise PlayerControlError(
+                "咪咕画质菜单中未找到可确认的“蓝光”选项，"
+                "为避免误选原画/下载 App，暂不开始录制。"
+            )
+
+        self._close_quality_menu()
+        self.page.wait_for_timeout(self.PAGE_SETTLE_MS // 2)
 
         if activate:
             self._activate_video(self.PLAY_SELECTORS)
+            self.page.wait_for_timeout(self.PLAYBACK_SETTLE_MS)
+            self._dismiss_qrcode()
+            self._dismiss_ad_overlay()
             self._normalize_fullscreen_layout()
 
         return self._state(self.PLAYER_SELECTOR, quality=quality)
+
+    def _select_blue_quality(self, fallback_steps: int = 0) -> str:
+        """选择蓝光；多次播放失败后按菜单顺序降一档。"""
+
+        if not self._click_first([".ratetype"]):
+            return ""
+
+        items = self.page.locator(".ratetype-content .item-rt")
+        visible_items = []
+        for index in range(items.count()):
+            item = items.nth(index)
+            try:
+                if item.is_visible(timeout=500):
+                    visible_items.append((item, item.inner_text().strip()))
+            except Exception:
+                continue
+
+        def is_safe_fallback(quality: str) -> bool:
+            upper_quality = quality.upper()
+            return not any(
+                marker in upper_quality
+                for marker in ("原画", "4K", "下载", "APP", "智能")
+            )
+
+        # 画质内部值可能随页面模板变化，因此先按用户可见的“蓝光”文字匹配。
+        blue_index = next(
+            (
+                index
+                for index, (_, quality) in enumerate(visible_items)
+                if "蓝光" in quality and is_safe_fallback(quality)
+            ),
+            None,
+        )
+        item_and_quality = (
+            visible_items[blue_index]
+            if blue_index is not None and fallback_steps <= 0
+            else None
+        )
+
+        # 发生多次播放失败后，从蓝光下方按页面实际排列选择下一档安全画质。
+        # 通常会得到“高清 720P”，但不假定所有播放页的 data-val 都相同。
+        if blue_index is not None and fallback_steps > 0:
+            lower_items = visible_items[blue_index + 1:]
+            safe_lower = [
+                pair for pair in lower_items if is_safe_fallback(pair[1])
+            ]
+            if safe_lower:
+                item_and_quality = safe_lower[min(fallback_steps - 1, len(safe_lower) - 1)]
+
+        # 兼容已观察到的旧页面，但仍要求其显示文字确实是蓝光，防止
+        # data-val="4" 在新页面中被重新定义后误选。
+        if item_and_quality is None and fallback_steps <= 0:
+            fallback = self.page.locator(self.BLUE_QUALITY_FALLBACK_SELECTOR).first
+            for item, quality in visible_items:
+                if item.get_attribute("data-val") == "4":
+                    fallback = item
+                    break
+            try:
+                if fallback.is_visible(timeout=500):
+                    fallback_quality = fallback.inner_text().strip()
+                    if "蓝光" in fallback_quality:
+                        item_and_quality = (fallback, fallback_quality)
+            except Exception:
+                pass
+
+        if item_and_quality is None:
+            return ""
+
+        item, quality = item_and_quality
+        try:
+            item.click(timeout=1200, force=True)
+            # 给播放器切换码率和更新当前选中标记留出时间。
+            self.page.wait_for_timeout(400)
+            return quality
+        except Exception:
+            return ""
 
     def inspect(self) -> PlayerState:
         if not self.page.locator(self.VIDEO_SELECTOR).count():
             return PlayerState(self.site, False, False, True, False, 0, 0)
         self._dismiss_qrcode()
+        self._dismiss_ad_overlay()
         return self._state(self.PLAYER_SELECTOR)
 
     def _dismiss_qrcode(self) -> bool:
         """关闭咪咕播放器中央的手机客户端下载二维码。"""
 
-        overlay = self.page.locator(".qrcode-container")
-        if not overlay.count():
-            return False
-        try:
-            if not overlay.first.is_visible(timeout=300):
-                return False
-        except Exception:
-            return False
+        # 当前页面实际使用 .qrcode，旧页面则把它包在
+        # .qrcode-container 中。只检查后者会漏掉截图中的弹窗。
+        overlays = self.page.locator(".qrcode-container, .qrcode")
+        dismissed = False
 
-        close_button = overlay.first.locator(".qr-close")
+        for index in range(overlays.count()):
+            overlay = overlays.nth(index)
+            try:
+                if not overlay.is_visible(timeout=300):
+                    continue
+            except Exception:
+                continue
+
+            close_button = overlay.locator(
+                ".qr-close, .close, [aria-label='关闭'], [title='关闭']"
+            )
+            try:
+                if close_button.count() and close_button.first.is_visible(timeout=300):
+                    close_button.first.click(force=True, timeout=1000)
+            except Exception:
+                pass
+
+            try:
+                if overlay.is_visible(timeout=300):
+                    overlay.evaluate(
+                        "element => { element.style.display = 'none'; }"
+                    )
+                dismissed = True
+            except Exception:
+                continue
+
+        return dismissed
+
+    def _dismiss_ad_overlay(self) -> bool:
+        """关闭咪咕播放器首屏广告层，避免它挡住播放按钮。"""
+
+        # adver-box 是咪咕播放器的首屏广告容器；部分页面会额外渲染
+        # 一个带 close 类名的广告节点。不要隐藏 player-tips，它包含播放控制。
+        selectors = [
+            "#mod-player .adver-box .close",
+            "#mod-player .adver-box [aria-label='关闭']",
+            "#mod-player .adver-box [title='关闭']",
+            "#mod-player .ad-close",
+            "#mod-player .advert-close",
+            "#mod-player [class*='adver'] [class*='close']",
+            "#mod-player [class*='advert'] [class*='close']",
+        ]
+        clicked = self._click_first(selectors, timeout=700)
+
         try:
-            if close_button.count() and close_button.first.is_visible(timeout=300):
-                close_button.first.click(force=True, timeout=1000)
+            hidden = self.page.evaluate(
+                """
+                () => {
+                    const player = document.querySelector('#mod-player');
+                    if (!player) return false;
+                    const candidates = [
+                        ...player.querySelectorAll(
+                            '#adver-box, .adver-box, .ad-close, .advert-close'
+                        )
+                    ];
+                    let changed = false;
+                    for (const element of candidates) {
+                        const rect = element.getBoundingClientRect();
+                        const style = getComputedStyle(element);
+                        if (
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden'
+                        ) {
+                            element.style.setProperty('display', 'none', 'important');
+                            changed = true;
+                        }
+                    }
+                    return changed;
+                }
+                """
+            )
         except Exception:
-            pass
-        try:
-            if overlay.first.is_visible(timeout=300):
-                overlay.first.evaluate(
-                    "element => { element.style.display = 'none'; }"
-                )
-        except Exception:
-            pass
-        return True
+            hidden = False
+
+        return bool(clicked or hidden)
 
 
 class FeisuPlayerAdapter(PlayerAdapter):
@@ -511,7 +679,11 @@ class FeisuPlayerAdapter(PlayerAdapter):
             timeout=700,
         )
 
-    def prepare(self, activate: bool = False) -> PlayerState:
+    def prepare(
+        self,
+        activate: bool = False,
+        quality_fallback_steps: int = 0,
+    ) -> PlayerState:
         self._wait_for_video(self.VIDEO_SELECTOR)
         video = self.page.locator(self.VIDEO_SELECTOR).first
         if not video.count():

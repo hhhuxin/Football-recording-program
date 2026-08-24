@@ -26,6 +26,15 @@ from .player_adapter import (
 class SourceManager:
     """管理 A/B 两个直播源及其监控循环。"""
 
+    # 开赛前页面可能已经打开但尚未拉流。等待半小时后才退出，避免
+    # 短暂网络异常导致错过比赛，同时也避免后台线程无限等待。
+    SOURCE_WAIT_TIMEOUT_SECONDS = 30 * 60
+    PLAYBACK_PROGRESS_WAIT_MS = 6000
+    STARTUP_RESTART_ATTEMPTS = 2
+    ACTIVATION_ATTEMPTS = 3
+    # 前两次确认蓝光；连续失败后，第三次从页面菜单实际顺序降一档。
+    QUALITY_FALLBACK_AFTER_ATTEMPTS = 2
+
     def __init__(
         self,
         browser,
@@ -118,11 +127,16 @@ class SourceManager:
 
         self.browser.close_managed_pages()
         self.page_a = self.browser.open_page(site_a_url)
+        self._safe_log("网站 A 页面已打开，等待播放器和二维码加载 3 秒……")
+        self.page_a.wait_for_timeout(3000)
         self.page_b = (
             self.browser.open_page(site_b_url)
             if site_b_url.strip()
             else None
         )
+        if self.page_b is not None:
+            self._safe_log("网站 B 页面已打开，等待播放器初始化 3 秒……")
+            self.page_b.wait_for_timeout(3000)
         self.browser.close_unexpected_pages(
             [self.page_a, self.page_b],
             self._allowed_hosts(site_a_url, site_b_url),
@@ -144,7 +158,13 @@ class SourceManager:
     ) -> PlayerState:
         """保证当前页独占媒体、没有外部弹窗并保持前台播放。"""
 
-        state = adapter_for(site, page).ensure_active()
+        # activate_source 已经完成了带延时的播放、画质和全屏操作。这里先
+        # 检查现状，避免稳定化阶段再次无条件调用 ensure_active 导致播放器
+        # 在短时间内重复切换状态而卡住。
+        adapter = adapter_for(site, page)
+        state = adapter.inspect()
+        if not state.ready_for_recording:
+            state = adapter.ensure_active()
         self.browser.silence_other_pages(page)
         self.browser.close_unexpected_pages(
             [self.page_a, self.page_b, page],
@@ -257,7 +277,7 @@ class SourceManager:
         return self.page_a if site == "A" else self.page_b
 
     def activate_source(self, site: str) -> PlayerState:
-        """激活指定源：停用另一源、置前、播放、最高画质、全屏。"""
+        """激活指定源：停用另一源、置前、播放、蓝光画质、全屏。"""
 
         page = self._page_for_site(site)
         if page is None or page.is_closed():
@@ -281,18 +301,102 @@ class SourceManager:
         )
 
         last_state: PlayerState | None = None
-        for _ in range(3):
-            state = adapter_for(site, page).prepare(activate=True)
+        last_error: PlayerControlError | None = None
+        for attempt in range(self.ACTIVATION_ATTEMPTS):
+            if attempt:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2500)
+            quality_fallback_steps = max(
+                0,
+                attempt - self.QUALITY_FALLBACK_AFTER_ATTEMPTS + 1,
+            )
+            try:
+                state = adapter_for(site, page).prepare(
+                    activate=True,
+                    quality_fallback_steps=quality_fallback_steps,
+                )
+            except PlayerControlError as error:
+                last_error = error
+                self._safe_log(
+                    f"网站 {site} 第 {attempt + 1} 次播放器准备失败：{error}"
+                )
+                continue
             last_state = state
+            if quality_fallback_steps:
+                self._safe_log(
+                    f"网站 {site} 已连续尝试 {attempt + 1} 次，"
+                    f"画质降为菜单中的下一档：{state.quality or '未返回名称'}。"
+                )
             if state.ready_for_recording:
-                return self._stabilize_active_source(site, page)
+                stabilized = self._stabilize_active_source(site, page)
+                if self._has_playback_progress(page):
+                    return stabilized
+                last_state = stabilized
+                self._safe_log(
+                    f"网站 {site} 播放器状态看似就绪，但 currentTime 未推进，"
+                    "等待后重试，暂不启动 OBS。"
+                )
 
         raise PlayerControlError(
             f"网站 {site} 未达到录制条件："
             f"播放={last_state.playing if last_state else False}，"
             f"静音={last_state.muted if last_state else True}，"
-            f"全屏={last_state.fullscreen if last_state else False}。"
+            f"全屏={last_state.fullscreen if last_state else False}，"
+            f"画质={last_state.quality if last_state else ''}，"
+            f"弹幕关闭={last_state.danmaku_disabled if last_state else False}，"
+            "currentTime 未连续推进。"
+            + (f"\n最后一次播放器错误：{last_error}" if last_error else "")
         )
+
+    def _has_playback_progress(self, page: Page) -> bool:
+        """确认播放器不是只停在一帧画面后就启动 OBS。"""
+
+        video = page.locator("video").first
+        last_time: float | None = None
+        sample_count = max(2, self.PLAYBACK_PROGRESS_WAIT_MS // 1000)
+        try:
+            for index in range(sample_count):
+                snapshot = video.evaluate(
+                    "video => ({paused: video.paused, currentTime: video.currentTime})",
+                    timeout=5000,
+                )
+                current_time = float(snapshot.get("currentTime", 0))
+                if not bool(snapshot.get("paused", True)):
+                    # 播放器重建 video 节点时 currentTime 可能归零；重建后
+                    # 从新时间点继续增长，仍然说明直播已经恢复出帧。
+                    if last_time is not None and current_time > last_time + 0.1:
+                        return True
+                    last_time = current_time
+                else:
+                    last_time = None
+
+                if index < sample_count - 1:
+                    page.wait_for_timeout(1000)
+        except Exception:
+            return False
+
+        return False
+
+    def check_active_playback(self) -> tuple[PlayerState | None, bool]:
+        """检查当前源状态和画面时间是否持续推进。"""
+
+        if self.current_site is None:
+            return None, False
+        page = self._page_for_site(self.current_site)
+        if page is None or page.is_closed():
+            return None, False
+
+        adapter = adapter_for(self.current_site, page)
+        state = adapter.inspect()
+        return state, bool(state.ready_for_recording and self._has_playback_progress(page))
+
+    def restart_session(self, site_a_url: str, site_b_url: str):
+        """重启项目专用 Chrome，并重新建立 A/B 页面和播放器会话。"""
+
+        self._safe_log("正在关闭卡死的项目专用 Chrome……")
+        self.browser.restart()
+        self._safe_log("Chrome 已重启，重新打开直播页面……")
+        return self.open_and_select(site_a_url, site_b_url)
 
     def activate_first_ready_source(
         self,
@@ -334,14 +438,20 @@ class SourceManager:
         任务被取消时返回 None。
         """
 
+        self._safe_log("正在连接 Chrome 调试浏览器……")
         self.browser.start()
 
+        self._safe_log("正在打开网站 A 直播页……")
         page_a, page_b = self.open_sites(site_a_url, site_b_url)
+        if page_b is not None:
+            self._safe_log("正在打开网站 B 备用直播页……")
 
         # 两个页面都先关闭声音并关闭弹幕；真正使用的页面稍后再激活。
+        self._safe_log("正在准备播放器并关闭弹窗……")
         self.prepare_backup_page("A", page_a)
         self.prepare_backup_page("B", page_b)
 
+        self._safe_log("正在检测网站 A/B 的直播状态……")
         status_a = self.probe_source("A", page_a, site_a_url)
         status_b = (
             self.probe_source("B", page_b, site_b_url)
@@ -361,16 +471,30 @@ class SourceManager:
             interval=5,
         )
 
-        selected = monitor.choose_site(status_a, status_b)
+        selected = self._playing_site_or_none(
+            monitor.choose_site(status_a, status_b)
+        )
+        self._log_waiting_status(status_a, status_b, initial=True)
 
         # A/B 都没有可用直播源时：等待重试，而不是直接失败退出。
         # 直播源经常在开赛前几分钟才拉流，需要轮询等待。
         waiting_logged = False
+        wait_started = time.monotonic()
+        last_status_log = wait_started
         while selected is None and self.task_active:
+            elapsed = time.monotonic() - wait_started
+            if elapsed >= self.SOURCE_WAIT_TIMEOUT_SECONDS:
+                raise PlayerControlError(
+                    "直播源等待超时（30 分钟）。\n"
+                    + self._format_waiting_status(status_a, status_b)
+                    + "\n请检查直播是否已开始、账号登录状态和咪咕弹窗。"
+                )
+
             if not waiting_logged:
                 self._safe_log(
                     "A、B 两个网站当前都没有可用直播源，"
-                    "进入等待模式，每 5 秒检测一次……"
+                    "进入等待模式，每 5 秒检测一次；"
+                    "只有视频真正播放后才会启动 OBS。"
                 )
                 waiting_logged = True
 
@@ -380,7 +504,14 @@ class SourceManager:
                 break
 
             status_a, status_b = monitor.detect_once()
-            selected = monitor.choose_site(status_a, status_b)
+            selected = self._playing_site_or_none(
+                monitor.choose_site(status_a, status_b)
+            )
+
+            now = time.monotonic()
+            if now - last_status_log >= 30 and selected is None:
+                self._log_waiting_status(status_a, status_b)
+                last_status_log = now
 
             if selected is not None:
                 self._safe_log(
@@ -395,11 +526,61 @@ class SourceManager:
                 "A、B 两个网站当前都没有可用直播源。"
             )
 
-        selected, player_state = self.activate_first_ready_source(
-            selected.name,
-            status_a,
-            status_b,
-        )
+        player_state: PlayerState | None = None
+        for restart_attempt in range(self.STARTUP_RESTART_ATTEMPTS + 1):
+            try:
+                selected, player_state = self.activate_first_ready_source(
+                    selected.name,
+                    status_a,
+                    status_b,
+                )
+                break
+            except PlayerControlError as error:
+                if restart_attempt >= self.STARTUP_RESTART_ATTEMPTS:
+                    raise PlayerControlError(
+                        "首选源和备用源都未达到录制条件，已完成自动重试。\n"
+                        f"{error}"
+                    ) from error
+
+                self._safe_log(
+                    f"播放器启动失败（第 {restart_attempt + 1} 次）：{error}"
+                )
+                self._safe_log(
+                    "将退出并重启项目专用 Chrome，然后重新执行播放器操作……"
+                )
+                self.browser.restart()
+                page_a, page_b = self.open_sites(site_a_url, site_b_url)
+                self.prepare_backup_page("A", page_a)
+                self.prepare_backup_page("B", page_b)
+                status_a = self.probe_source("A", page_a, site_a_url)
+                status_b = (
+                    self.probe_source("B", page_b, site_b_url)
+                    if page_b is not None
+                    else SiteStatus(
+                        name="B",
+                        url="",
+                        result=self._unconfigured_result(),
+                    )
+                )
+                monitor = SourceMonitor(
+                    page_a=page_a,
+                    page_b=page_b,
+                    site_a_url=site_a_url,
+                    site_b_url=site_b_url,
+                    interval=5,
+                )
+                selected = self._playing_site_or_none(
+                    monitor.choose_site(status_a, status_b)
+                )
+                if selected is None:
+                    raise PlayerControlError(
+                        "Chrome 重启后仍未检测到真正推进画面的直播源。"
+                    ) from error
+
+        if player_state is None:
+            raise PlayerControlError(
+                "播放器启动失败，未能取得有效播放器状态。"
+            )
 
         # 保留备用页供 SourceMonitor 继续检测；它已被静音/暂停，不能产生第二路声音。
         self.deactivate_source("B" if selected.name == "A" else "A")
@@ -415,6 +596,41 @@ class SourceManager:
             status_b,
             player_state,
         )
+
+    @staticmethod
+    def _playing_site_or_none(selected: SiteStatus | None) -> SiteStatus | None:
+        """启动阶段只接受真正播放中的源，暂停页面继续等待。"""
+
+        if selected is None or not SourceMonitor._is_playing(selected):
+            return None
+        return selected
+
+    @staticmethod
+    def _format_waiting_status(
+        status_a: SiteStatus,
+        status_b: SiteStatus,
+    ) -> str:
+        def describe(status: SiteStatus) -> str:
+            result = status.result
+            resolution = f"{result.video_width}x{result.video_height}"
+            details = result.details or "无详细信息"
+            return (
+                f"网站 {status.name}：状态={result.status}，"
+                f"播放={result.video_playing}，"
+                f"currentTime={result.current_time:.1f}，"
+                f"分辨率={resolution}，详情={details}"
+            )
+
+        return "\n".join((describe(status_a), describe(status_b)))
+
+    def _log_waiting_status(
+        self,
+        status_a: SiteStatus,
+        status_b: SiteStatus,
+        initial: bool = False,
+    ) -> None:
+        prefix = "初次检测结果：" if initial else "直播源仍未就绪："
+        self._safe_log(prefix + "\n" + self._format_waiting_status(status_a, status_b))
 
     # =========================================================
     # 监控循环

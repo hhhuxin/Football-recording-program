@@ -27,9 +27,11 @@ from .source_manager import SourceManager
 
 
 class OBSMatchRecorderApp:
+    RECORDING_HEALTH_INTERVAL_MS = 3 * 60 * 1000
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("OBS 比赛录制助手 V1.1")
+        self.root.title("OBS 比赛录制助手 V1.2")
         self.root.minsize(820, 700)
 
         self.root.columnconfigure(0, weight=1)
@@ -53,6 +55,9 @@ class OBSMatchRecorderApp:
         self.scheduled_time: datetime | None = None
         self.recording_deadline: datetime | None = None
         self.recording_stop_after_id = None
+        self.recording_health_after_id = None
+        self.recording_health_active = False
+        self.recording_recovery_active = False
 
         self.browser = BrowserController()
 
@@ -505,7 +510,7 @@ class OBSMatchRecorderApp:
             return
 
         self.log(
-            "正在启动 Playwright 浏览器……"
+            "正在启动项目专用 Chrome 浏览器……"
         )
 
         def work():
@@ -555,7 +560,7 @@ class OBSMatchRecorderApp:
             )
 
             self.log(
-                "Playwright 浏览器测试通过。"
+                "Chrome 浏览器测试通过。"
             )
 
             messagebox.showinfo(
@@ -711,6 +716,22 @@ class OBSMatchRecorderApp:
             work,
             self._recording_workflow_started,
             error_title="启动录制失败",
+            on_error=self._recording_workflow_failed,
+        )
+
+    def _recording_workflow_failed(self, error) -> None:
+        """启动阶段失败时保留任务并自动重试，避免错过比赛。"""
+
+        if not self.task_active:
+            return
+
+        self.log(
+            f"启动录制失败：{error}。"
+            "项目专用 Chrome 已完成重试，30 秒后再次打开直播页面。"
+        )
+        self.root.after(
+            30000,
+            self._start_recording_workflow,
         )
 
     def _recording_workflow_started(
@@ -795,6 +816,7 @@ class OBSMatchRecorderApp:
 
         # 确保只启动一个监控循环
         self.sources.start_monitor_loop()
+        self._schedule_recording_health_check()
 
     # 停止任务
     # =========================================================
@@ -810,6 +832,8 @@ class OBSMatchRecorderApp:
 
         # 停止直播源管理：作废所有旧监控回调并停止监控器
         self.sources.stop()
+        self._cancel_recording_health_check()
+        self.recording_recovery_active = False
 
         self.start_task_button.configure(
             state="normal"
@@ -876,6 +900,161 @@ class OBSMatchRecorderApp:
 
         self.log("已达到最大录制时长，正在自动停止 OBS 录制……")
         self.stop_task()
+
+    def _schedule_recording_health_check(self) -> None:
+        if self.recording_health_after_id is not None:
+            try:
+                self.root.after_cancel(self.recording_health_after_id)
+            except tk.TclError:
+                pass
+
+        if not self.task_active or not self.recording_started_by_app:
+            self.recording_health_after_id = None
+            return
+
+        self.recording_health_after_id = self.root.after(
+            self.RECORDING_HEALTH_INTERVAL_MS,
+            self._run_recording_health_check,
+        )
+
+    def _cancel_recording_health_check(self) -> None:
+        if self.recording_health_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.recording_health_after_id)
+        except tk.TclError:
+            pass
+        self.recording_health_after_id = None
+
+    def _run_recording_health_check(self) -> None:
+        self.recording_health_after_id = None
+        if (
+            not self.task_active
+            or not self.recording_started_by_app
+            or self.recording_health_active
+            or self.recording_recovery_active
+        ):
+            return
+
+        self.recording_health_active = True
+        config = self._collect_config()
+
+        def work():
+            obs_recording = OBSController(
+                connection_from_config(config)
+            ).is_recording()
+            player_state, playback_ok = self.sources.check_active_playback()
+            return obs_recording, playback_ok, player_state
+
+        self._run_in_background(
+            work,
+            self._recording_health_checked,
+            error_title="录制健康检查失败",
+            on_error=self._recording_health_check_failed,
+        )
+
+    def _recording_health_check_failed(self, error) -> None:
+        self.recording_health_active = False
+        if not self.task_active or not self.recording_started_by_app:
+            return
+        self.log(f"录制健康检查异常：{error}。准备重启 Chrome 和录制流程。")
+        self._start_recording_recovery("健康检查无法完成")
+
+    def _recording_health_checked(self, result) -> None:
+        self.recording_health_active = False
+        if not self.task_active or not self.recording_started_by_app:
+            return
+
+        obs_recording, playback_ok, player_state = result
+        if obs_recording and playback_ok:
+            self.log(
+                "录制健康检查通过：OBS 正在录制，"
+                "当前直播画面仍在播放。"
+            )
+            self._schedule_recording_health_check()
+            return
+
+        self.log(
+            "录制健康检查失败："
+            f"OBS录制={obs_recording}，"
+            f"播放条件={playback_ok}，"
+            f"播放器状态={player_state}。"
+        )
+        self._start_recording_recovery("OBS 或直播播放状态异常")
+
+    def _start_recording_recovery(self, reason: str) -> None:
+        if self.recording_recovery_active or not self.task_active:
+            return
+
+        self.recording_recovery_active = True
+        self.sources.invalidate_monitor_loop()
+        config = self._collect_config()
+        self.log(
+            f"{reason}，正在停止当前录制并退出 Chrome，"
+            "随后重新打开页面和 OBS……"
+        )
+
+        def work():
+            obs = OBSController(connection_from_config(config))
+            try:
+                obs.stop_recording()
+            except OBSControllerError:
+                # OBS 已经停止时允许继续重建播放会话。
+                pass
+
+            if not self.task_active:
+                return None
+
+            result = self.sources.restart_session(
+                config.site_a_url,
+                config.site_b_url,
+            )
+            if not self.task_active:
+                return None
+            obs.start_recording(config.obs_recording_directory)
+            return result
+
+        self._run_in_background(
+            work,
+            self._recording_recovery_finished,
+            error_title="自动恢复录制失败",
+            on_error=self._recording_recovery_failed,
+        )
+
+    def _recording_recovery_finished(self, result) -> None:
+        self.recording_recovery_active = False
+        if not self.task_active or result is None:
+            return
+
+        (
+            page_a,
+            page_b,
+            monitor,
+            selected,
+            status_a,
+            status_b,
+            player_state,
+        ) = result
+        self.sources.page_a = page_a
+        self.sources.page_b = page_b
+        self.sources.source_monitor = monitor
+        self.sources.current_site = selected.name
+        self.recording_started_by_app = True
+
+        self.log(
+            f"自动恢复完成：当前直播源为网站 {selected.name}，"
+            f"播放={player_state.playing}，静音={player_state.muted}，"
+            f"全屏={player_state.fullscreen}。"
+        )
+        self.sources.start_monitor_loop()
+        self._schedule_recording_health_check()
+
+    def _recording_recovery_failed(self, error) -> None:
+        self.recording_recovery_active = False
+        if not self.task_active:
+            return
+        self.log(f"自动恢复录制失败：{error}。3 分钟后再次检查并重试。")
+        self._schedule_recording_health_check()
 
     def _run_in_background(
         self,
@@ -999,6 +1178,8 @@ class OBSMatchRecorderApp:
         self.task_active = False
 
         self._cancel_recording_timer()
+        self._cancel_recording_health_check()
+        self.recording_recovery_active = False
 
         self.sources.close()
 

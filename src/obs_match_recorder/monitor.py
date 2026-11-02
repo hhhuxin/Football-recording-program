@@ -62,7 +62,7 @@ class SourceMonitor:
                 current_time=0.0,
                 video_width=0,
                 video_height=0,
-                details="网站 B 未配置",
+                details="海星体育未配置",
             )
         )
 

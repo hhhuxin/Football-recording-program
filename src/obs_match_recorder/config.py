@@ -21,6 +21,7 @@ class AppConfig:
     max_recording_minutes: str = "150"
     site_a_url: str = ""
     site_b_url: str = ""
+    browser_mode: str = "chrome"
     obs_recording_directory: str = ""
     obs_host: str = "localhost"
     obs_port: str = "4455"
@@ -64,10 +65,10 @@ def validate_sites(config: AppConfig) -> list[str]:
     errors: list[str] = []
 
     for label, address in (
-        ("网站 A", config.site_a_url),
-        ("网站 B", config.site_b_url),
+        ("咪咕视频", config.site_a_url),
+        ("海星体育", config.site_b_url),
     ):
-        if label == "网站 B" and not address:
+        if not address and label in {"咪咕视频", "海星体育"}:
             continue
 
         parsed = urlparse(address)
@@ -171,8 +172,19 @@ def validate_obs_connection(config: AppConfig) -> list[str]:
 def connection_from_config(config: AppConfig) -> OBSConnection:
     """从配置构造 OBS 连接参数。"""
 
+    password = config.obs_password
+    if not password and config.obs_host.strip().lower() in {"localhost", "127.0.0.1", "::1"}:
+        # 本机迁移或旧界面保存空密码时，沿用 OBS 自己的认证配置。
+        obs_config = Path(os.environ.get("APPDATA", "")) / "obs-studio/plugin_config/obs-websocket/config.json"
+        try:
+            settings = json.loads(obs_config.read_text(encoding="utf-8-sig"))
+            if settings.get("auth_required") and int(settings.get("server_port", 4455)) == int(config.obs_port):
+                password = str(settings.get("server_password") or "")
+        except (OSError, ValueError, TypeError):
+            pass
+
     return OBSConnection(
         host=config.obs_host,
         port=int(config.obs_port),
-        password=config.obs_password,
+        password=password,
     )

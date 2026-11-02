@@ -17,6 +17,7 @@ from playwright.sync_api import Page
 from .detector import DetectionResult, LiveDetector
 from .monitor import SiteStatus, SourceMonitor
 from .player_adapter import (
+    HaixingPlayerAdapter,
     PlayerControlError,
     PlayerState,
     adapter_for,
@@ -26,14 +27,18 @@ from .player_adapter import (
 class SourceManager:
     """管理 A/B 两个直播源及其监控循环。"""
 
+    SITE_LABELS = {"A": "咪咕视频", "B": "海星体育"}
+
     # 开赛前页面可能已经打开但尚未拉流。等待半小时后才退出，避免
     # 短暂网络异常导致错过比赛，同时也避免后台线程无限等待。
     SOURCE_WAIT_TIMEOUT_SECONDS = 30 * 60
     PLAYBACK_PROGRESS_WAIT_MS = 6000
+    HIGH_QUALITY_SETTLE_MS = 10_000
+    HIGH_QUALITY_PROGRESS_WAIT_MS = 15_000
+    ADVERTISEMENT_WAIT_TIMEOUT_SECONDS = 100
+    ADVERTISEMENT_POLL_INTERVAL_MS = 1000
     STARTUP_RESTART_ATTEMPTS = 2
     ACTIVATION_ATTEMPTS = 3
-    # 前两次确认蓝光；连续失败后，第三次从页面菜单实际顺序降一档。
-    QUALITY_FALLBACK_AFTER_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -69,6 +74,10 @@ class SourceManager:
         # 任务是否仍然活跃（由 GUI 层控制）
         self.task_active = False
 
+    @classmethod
+    def site_label(cls, site: str | None) -> str:
+        return cls.SITE_LABELS.get(site or "", site or "未知源")
+
     # =========================================================
     # 生命周期
     # =========================================================
@@ -92,11 +101,6 @@ class SourceManager:
             except Exception:
                 pass
 
-        if self.current_site is not None:
-            page = self._page_for_site(self.current_site)
-            if page is not None and not page.is_closed():
-                self.browser.restore_cursor(page)
-
     def close(self) -> None:
         """关闭所有页面与监控（程序退出时调用）。"""
 
@@ -109,10 +113,14 @@ class SourceManager:
             except Exception:
                 pass
 
-        if self.current_site is not None:
-            page = self._page_for_site(self.current_site)
-            if page is not None and not page.is_closed():
-                self.browser.restore_cursor(page)
+    def restore_active_cursor(self) -> None:
+        """恢复当前页面鼠标样式；调用方必须在浏览器工作线程执行。"""
+
+        if self.current_site is None:
+            return
+        page = self._page_for_site(self.current_site)
+        if page is not None and not page.is_closed():
+            self.browser.restore_cursor(page)
 
     # =========================================================
     # 页面操作
@@ -122,26 +130,46 @@ class SourceManager:
         self,
         site_a_url: str,
         site_b_url: str,
-    ) -> tuple[Page, Page | None]:
+    ) -> tuple[Page | None, Page | None]:
         """打开（或重新打开）A/B 两个页面，并保存引用。"""
 
         self.browser.close_managed_pages()
-        self.page_a = self.browser.open_page(site_a_url)
-        self._safe_log("网站 A 页面已打开，等待播放器和二维码加载 3 秒……")
-        self.page_a.wait_for_timeout(3000)
+        self.page_a = self.browser.open_page(site_a_url) if site_a_url.strip() else None
+        if self.page_a is not None:
+            self._safe_log("咪咕视频页面已打开，等待播放器和二维码加载 3 秒……")
+            self.page_a.wait_for_timeout(3000)
         self.page_b = (
             self.browser.open_page(site_b_url)
             if site_b_url.strip()
             else None
         )
         if self.page_b is not None:
-            self._safe_log("网站 B 页面已打开，等待播放器初始化 3 秒……")
+            self._safe_log("海星体育页面已打开，等待播放器初始化 3 秒……")
             self.page_b.wait_for_timeout(3000)
         self.browser.close_unexpected_pages(
             [self.page_a, self.page_b],
             self._allowed_hosts(site_a_url, site_b_url),
         )
         return self.page_a, self.page_b
+
+    def prepare_haixing_test_playback(self) -> PlayerState | None:
+        """仅准备海星试听画面，不启动录制或源监控。"""
+        if self.page_b is None:
+            return None
+        self.page_b.bring_to_front()
+        if self.page_a is not None:
+            adapter_for("A", self.page_a).deactivate()
+        self._safe_log("海星体育：正在取消静音、选择原画质、进入全屏……")
+        adapter = HaixingPlayerAdapter(self.page_b)
+        state = adapter.prepare(activate=True)
+        if not state.ready_for_recording:
+            raise PlayerControlError(f"海星播放设置未完成：{state}")
+        if "原画" not in state.quality:
+            self._safe_log(
+                f"海星当前实际画质为「{state.quality}」，未切换到原画。"
+                "网站要求登录后才能切换画质，请在此浏览器登录后重新测试。"
+            )
+        return state
 
     @staticmethod
     def _allowed_hosts(*urls: str) -> set[str]:
@@ -186,15 +214,23 @@ class SourceManager:
         if page is None:
             return
 
+        advertisement_waited = self._wait_for_advertisement(site, page)
+        if advertisement_waited:
+            # prepare(activate=False) 会明确调用 video.pause()。广告刚结束时
+            # 不能再走这个备用页静音分支，后续 probe/activate 会立即恢复直播。
+            return
         try:
             adapter_for(site, page).prepare(activate=False)
         except PlayerControlError:
             # 页面可能还在广告/登录跳转中，后续检测和切换会再次尝试。
             pass
 
-    def probe_source(self, site: str, page: Page, url: str) -> SiteStatus:
+    def probe_source(self, site: str, page: Page | None, url: str) -> SiteStatus:
+        if page is None:
+            return SiteStatus(name=site, url=url, result=self._unconfigured_result())
         """串行唤醒并检测单个来源，确保另一个来源不会同时出声。"""
 
+        self._wait_for_advertisement(site, page)
         page.bring_to_front()
         self.browser.silence_other_pages(page)
         try:
@@ -203,11 +239,6 @@ class SourceManager:
             pass
 
         result = LiveDetector(page).detect()
-
-        try:
-            adapter_for(site, page).deactivate()
-        except Exception:
-            pass
 
         return SiteStatus(name=site, url=url, result=result)
 
@@ -225,7 +256,7 @@ class SourceManager:
             current_time=0.0,
             video_width=0,
             video_height=0,
-            details="网站 B 未配置",
+            details="海星体育未配置",
         )
 
     def refresh_source(self, site: str) -> None:
@@ -236,18 +267,29 @@ class SourceManager:
             return
 
         try:
+            # 广告页不能刷新，否则 90 秒广告会从头开始。广告结束后直接
+            # 恢复播放器准备流程，只有不存在广告时才执行页面刷新。
+            if self._wait_for_advertisement(site, page):
+                if adapter_for(site, page).has_active_advertisement():
+                    return
+                adapter_for(site, page).prepare(activate=True)
+                if self.source_monitor is not None:
+                    self.source_monitor.reset_progress(site)
+                return
+
             page.reload(wait_until="domcontentloaded", timeout=30000)
+            self._wait_for_advertisement(site, page)
             adapter_for(site, page).prepare(activate=True)
             if self.source_monitor is not None:
                 self.source_monitor.reset_progress(site)
         except Exception as error:
-            self._safe_log(f"网站 {site} 刷新失败：{error}")
+            self._safe_log(f"{self.site_label(site)}刷新失败：{error}")
 
     def reopen_source(self, site: str, url: str) -> None:
         """重新打开备用源页面并替换监控引用（后台线程调用）。"""
 
         if not url:
-            self._safe_log(f"网站 {site} 未配置备用 URL，继续等待当前源恢复。")
+            self._safe_log(f"{self.site_label(site)}未配置备用 URL，继续等待当前源恢复。")
             return
 
         page = self.browser.open_page(url)
@@ -276,12 +318,54 @@ class SourceManager:
     def _page_for_site(self, site: str) -> Page | None:
         return self.page_a if site == "A" else self.page_b
 
+    def _wait_for_advertisement(self, site: str, page: Page) -> bool:
+        """等待片前广告结束；整个等待过程不刷新、不点击播放器。"""
+
+        adapter = adapter_for(site, page)
+        if not adapter.has_active_advertisement():
+            return False
+
+        # 先尝试 Chrome 全屏；即使该步骤未确认成功，仍必须继续点击咪咕
+        # 播放器右下角的全屏控件。后者可独立进入播放器全屏。
+        if not self.browser.ensure_foreground_and_fullscreen(page):
+            self._safe_log(
+                f"{self.site_label(site)}广告页未能确认浏览器全屏，"
+                "继续尝试咪咕播放器全屏。"
+            )
+        if not adapter.expand_advertisement_display():
+            self._safe_log(
+                f"{self.site_label(site)}广告页未能确认播放器铺满窗口，"
+                "仍将等待广告结束后继续播放准备。"
+            )
+
+        self._safe_log(
+            f"{self.site_label(site)}检测到片前广告，"
+            f"最多等待 {self.ADVERTISEMENT_WAIT_TIMEOUT_SECONDS} 秒，"
+            "广告结束前不刷新页面也不操作播放器。"
+        )
+        deadline = time.monotonic() + self.ADVERTISEMENT_WAIT_TIMEOUT_SECONDS
+        while self.task_active and time.monotonic() < deadline:
+            page.wait_for_timeout(self.ADVERTISEMENT_POLL_INTERVAL_MS)
+            if not adapter.has_active_advertisement():
+                self._safe_log(
+                    f"{self.site_label(site)}片前广告已结束，继续准备直播播放器。"
+                )
+                return True
+
+        if self.task_active:
+            self._safe_log(
+                f"{self.site_label(site)}片前广告等待超过 "
+                f"{self.ADVERTISEMENT_WAIT_TIMEOUT_SECONDS} 秒，"
+                "保留当前页面并继续常规直播检测，不刷新页面。"
+            )
+        return True
+
     def activate_source(self, site: str) -> PlayerState:
-        """激活指定源：停用另一源、置前、播放、蓝光画质、全屏。"""
+        """激活指定源：依次尝试原画、蓝光、高清 720P。"""
 
         page = self._page_for_site(site)
         if page is None or page.is_closed():
-            raise PlayerControlError(f"网站 {site} 页面不存在或已经关闭。")
+            raise PlayerControlError(f"{self.site_label(site)}页面不存在或已经关闭。")
 
         for other_site in ("A", "B"):
             if other_site == site:
@@ -299,6 +383,7 @@ class SourceManager:
                 self._url_for_site("B"),
             ),
         )
+        self._wait_for_advertisement(site, page)
 
         last_state: PlayerState | None = None
         last_error: PlayerControlError | None = None
@@ -306,10 +391,9 @@ class SourceManager:
             if attempt:
                 page.reload(wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(2500)
-            quality_fallback_steps = max(
-                0,
-                attempt - self.QUALITY_FALLBACK_AFTER_ATTEMPTS + 1,
-            )
+            # 三次准备严格对应原画、蓝光、高清 720P，避免原画一次
+            # 拉流较慢就越过蓝光直接降级。
+            quality_fallback_steps = attempt
             try:
                 state = adapter_for(site, page).prepare(
                     activate=True,
@@ -318,27 +402,49 @@ class SourceManager:
             except PlayerControlError as error:
                 last_error = error
                 self._safe_log(
-                    f"网站 {site} 第 {attempt + 1} 次播放器准备失败：{error}"
+                    f"{self.site_label(site)}第 {attempt + 1} 次播放器准备失败：{error}"
                 )
                 continue
             last_state = state
-            if quality_fallback_steps:
+            high_quality = any(
+                marker in state.quality for marker in ("原画", "蓝光")
+            )
+            if high_quality and not state.ready_for_recording:
+                # 咪咕切到原画/蓝光时会重新拉流，首秒可能短暂显示暂停。
+                # 不应立刻误判失败并降到 720P。
+                page.wait_for_timeout(self.HIGH_QUALITY_SETTLE_MS)
+                state = adapter_for(site, page).inspect()
+                last_state = state
+            if quality_fallback_steps == 1:
                 self._safe_log(
-                    f"网站 {site} 已连续尝试 {attempt + 1} 次，"
-                    f"画质降为菜单中的下一档：{state.quality or '未返回名称'}。"
+                    f"{self.site_label(site)}原画未稳定，"
+                    f"改用蓝光重试：{state.quality or '未返回名称'}。"
+                )
+            elif quality_fallback_steps >= 2:
+                self._safe_log(
+                    f"{self.site_label(site)}原画和蓝光均未稳定，"
+                    f"改用高清 720P 重试：{state.quality or '未返回名称'}。"
                 )
             if state.ready_for_recording:
                 stabilized = self._stabilize_active_source(site, page)
-                if self._has_playback_progress(page):
+                progress_wait_ms = (
+                    self.HIGH_QUALITY_PROGRESS_WAIT_MS
+                    if high_quality
+                    else self.PLAYBACK_PROGRESS_WAIT_MS
+                )
+                if self._has_playback_progress(page, progress_wait_ms, site):
+                    # 画面、声音和进度均确认成功后再藏鼠标。此前的全屏、
+                    # 画质和播放点击可能会重新让鼠标显示在画面中央。
+                    self.browser.hide_cursor(page)
                     return stabilized
                 last_state = stabilized
                 self._safe_log(
-                    f"网站 {site} 播放器状态看似就绪，但 currentTime 未推进，"
+                    f"{self.site_label(site)}播放器状态看似就绪，但 currentTime 未推进，"
                     "等待后重试，暂不启动 OBS。"
                 )
 
         raise PlayerControlError(
-            f"网站 {site} 未达到录制条件："
+            f"{self.site_label(site)}未达到录制条件："
             f"播放={last_state.playing if last_state else False}，"
             f"静音={last_state.muted if last_state else True}，"
             f"全屏={last_state.fullscreen if last_state else False}，"
@@ -348,12 +454,25 @@ class SourceManager:
             + (f"\n最后一次播放器错误：{last_error}" if last_error else "")
         )
 
-    def _has_playback_progress(self, page: Page) -> bool:
+    def _has_playback_progress(
+        self,
+        page: Page,
+        wait_ms: int | None = None,
+        site: str | None = None,
+    ) -> bool:
         """确认播放器不是只停在一帧画面后就启动 OBS。"""
 
-        video = page.locator("video").first
+        surface = (
+            HaixingPlayerAdapter.frame_for_page(page)
+            if site == "B"
+            else page
+        )
+        video = surface.locator("video").first
         last_time: float | None = None
-        sample_count = max(2, self.PLAYBACK_PROGRESS_WAIT_MS // 1000)
+        sample_count = max(
+            2,
+            (wait_ms or self.PLAYBACK_PROGRESS_WAIT_MS) // 1000,
+        )
         try:
             for index in range(sample_count):
                 snapshot = video.evaluate(
@@ -371,14 +490,14 @@ class SourceManager:
                     last_time = None
 
                 if index < sample_count - 1:
-                    page.wait_for_timeout(1000)
+                    surface.wait_for_timeout(1000)
         except Exception:
             return False
 
         return False
 
     def check_active_playback(self) -> tuple[PlayerState | None, bool]:
-        """检查当前源状态和画面时间是否持续推进。"""
+        """检查当前源；异常时先在原页面执行一次刷新恢复。"""
 
         if self.current_site is None:
             return None, False
@@ -388,7 +507,26 @@ class SourceManager:
 
         adapter = adapter_for(self.current_site, page)
         state = adapter.inspect()
-        return state, bool(state.ready_for_recording and self._has_playback_progress(page))
+        if state.ready_for_recording and self._has_playback_progress(
+            page, site=self.current_site
+        ):
+            return state, True
+
+        # 先在原标签页恢复一次，避免网页瞬时暂停就关闭 Chrome、打断录制。
+        # refresh_source 会识别片前广告，广告期间只等待而不会刷新。
+        self._safe_log(
+            f"{self.site_label(self.current_site)}播放暂停或画面未推进，"
+            "先刷新并重新准备播放器一次。"
+        )
+        self.refresh_source(self.current_site)
+
+        if page.is_closed():
+            return None, False
+        state = adapter_for(self.current_site, page).inspect()
+        return state, bool(
+            state.ready_for_recording
+            and self._has_playback_progress(page, site=self.current_site)
+        )
 
     def restart_session(self, site_a_url: str, site_b_url: str):
         """重启项目专用 Chrome，并重新建立 A/B 页面和播放器会话。"""
@@ -417,7 +555,7 @@ class SourceManager:
                 state = self.activate_source(site)
                 return statuses[site], state
             except PlayerControlError as error:
-                errors.append(f"网站 {site}：{error}")
+                errors.append(f"{self.site_label(site)}：{error}")
 
         raise PlayerControlError(
             "首选源和备用源都未达到录制条件。\n" + "\n".join(errors)
@@ -441,17 +579,17 @@ class SourceManager:
         self._safe_log("正在连接 Chrome 调试浏览器……")
         self.browser.start()
 
-        self._safe_log("正在打开网站 A 直播页……")
+        self._safe_log("正在打开咪咕视频直播页……")
         page_a, page_b = self.open_sites(site_a_url, site_b_url)
         if page_b is not None:
-            self._safe_log("正在打开网站 B 备用直播页……")
+            self._safe_log("正在打开海星体育备用直播页……")
 
         # 两个页面都先关闭声音并关闭弹幕；真正使用的页面稍后再激活。
         self._safe_log("正在准备播放器并关闭弹窗……")
         self.prepare_backup_page("A", page_a)
         self.prepare_backup_page("B", page_b)
 
-        self._safe_log("正在检测网站 A/B 的直播状态……")
+        self._safe_log("正在检测咪咕视频/海星体育的直播状态……")
         status_a = self.probe_source("A", page_a, site_a_url)
         status_b = (
             self.probe_source("B", page_b, site_b_url)
@@ -615,7 +753,8 @@ class SourceManager:
             resolution = f"{result.video_width}x{result.video_height}"
             details = result.details or "无详细信息"
             return (
-                f"网站 {status.name}：状态={result.status}，"
+                f"{SourceManager.SITE_LABELS.get(status.name, status.name)}："
+                f"状态={result.status}，"
                 f"播放={result.video_playing}，"
                 f"currentTime={result.current_time:.1f}，"
                 f"分辨率={resolution}，详情={details}"
@@ -743,7 +882,7 @@ class SourceManager:
                 # 先刷新当前页几次，给网络抖动和播放器重连留出时间。
                 if self.source_failure_counts[self.current_site] < 3:
                     self._log(
-                        f"网站 {self.current_site} 播放异常，"
+                        f"{self.site_label(self.current_site)}播放异常，"
                         f"第 {self.source_failure_counts[self.current_site]} 次重试并刷新页面。"
                     )
                     site = self.current_site
@@ -757,8 +896,8 @@ class SourceManager:
 
                 alternate = "B" if self.current_site == "A" else "A"
                 self._log(
-                    f"网站 {self.current_site} 连续恢复失败，"
-                    f"重新打开备用网站 {alternate}。"
+                    f"{self.site_label(self.current_site)}连续恢复失败，"
+                    f"重新打开备用{self.site_label(alternate)}。"
                 )
                 # URL 在主线程取好再传入后台线程，
                 # 避免后台线程读取 Tk 变量。
@@ -806,13 +945,13 @@ class SourceManager:
         )
 
         self._log(
-            f"网站 A：{status_a.result.status} | "
+            f"咪咕视频：{status_a.result.status} | "
             f"评分：{status_a.result.score} | "
             f"播放：{status_a.result.video_playing}"
         )
 
         self._log(
-            f"网站 B：{status_b.result.status} | "
+            f"海星体育：{status_b.result.status} | "
             f"评分：{status_b.result.score} | "
             f"播放：{status_b.result.video_playing}"
         )
@@ -827,7 +966,7 @@ class SourceManager:
 
         if selected.name == self.current_site:
             self._log(
-                f"当前直播源：网站 {selected.name}"
+                f"当前直播源：{self.site_label(selected.name)}"
             )
             self._schedule_next_monitor(loop_id)
             return
@@ -886,7 +1025,7 @@ class SourceManager:
 
         if old_source is None:
             self._log(
-                f"当前直播源：网站 {selected.name}"
+                f"当前直播源：{self.site_label(selected.name)}"
             )
         else:
             self._log(

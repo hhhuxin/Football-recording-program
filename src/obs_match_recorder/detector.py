@@ -29,6 +29,21 @@ class LiveDetector:
     def __init__(self, page: Page) -> None:
         self.page = page
 
+    def _player_surface(self):
+        """海星体育的实际 video 位于跨域 iframe，动态取最新 frame。"""
+
+        for frame in self.page.frames:
+            if frame is self.page.main_frame:
+                continue
+            if "video.club7275.top" in frame.url:
+                return frame
+            try:
+                if frame.locator("#dplayer, video").count():
+                    return frame
+            except Exception:
+                continue
+        return self.page
+
     def detect(self) -> DetectionResult:
         page_ok = False
         player_found = False
@@ -99,13 +114,14 @@ class LiveDetector:
         # 3. 查找 HTML5 Video
         # ---------------------------------------------------------
         try:
-            video_count = self.page.locator("video").count()
+            surface = self._player_surface()
+            video_count = surface.locator("video").count()
 
             if video_count > 0:
                 video_exists = True
                 details.append("找到 Video")
 
-                video = self.page.locator("video").first
+                video = surface.locator("video").first
 
                 data = video.evaluate(
                     """
@@ -142,6 +158,7 @@ class LiveDetector:
         # 4. 查找常见播放器元素
         # ---------------------------------------------------------
         try:
+            surface = self._player_surface()
             selectors = [
                 "video",
                 "iframe",
@@ -157,7 +174,7 @@ class LiveDetector:
 
             for selector in selectors:
                 try:
-                    if self.page.locator(selector).count() > 0:
+                    if surface.locator(selector).count() > 0:
                         player_found = True
                         break
                 except Exception:

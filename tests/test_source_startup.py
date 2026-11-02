@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 from obs_match_recorder.detector import DetectionResult
 from obs_match_recorder.monitor import SiteStatus
 from obs_match_recorder.source_manager import SourceManager
@@ -51,7 +53,52 @@ def test_waiting_status_contains_playback_diagnostics() -> None:
 
     message = SourceManager._format_waiting_status(status_a, status_b)
 
-    assert "网站 A" in message
+    assert "咪咕视频" in message
     assert "播放=False" in message
     assert "currentTime=12.5" in message
     assert "分辨率=1280x720" in message
+
+
+def test_advertisement_wait_covers_ninety_second_migu_preroll() -> None:
+    assert SourceManager.ADVERTISEMENT_WAIT_TIMEOUT_SECONDS >= 90
+    assert SourceManager.ADVERTISEMENT_POLL_INTERVAL_MS == 1000
+
+
+def test_probe_does_not_pause_a_page_after_detection() -> None:
+    source = inspect.getsource(SourceManager.probe_source)
+
+    assert ".deactivate()" not in source
+
+
+def test_advertisement_completion_skips_backup_page_pause() -> None:
+    source = inspect.getsource(SourceManager.prepare_backup_page)
+
+    assert "advertisement_waited = self._wait_for_advertisement(site, page)" in source
+    assert "if advertisement_waited:" in source
+    assert "return" in source
+
+
+def test_active_playback_check_retries_current_page_before_full_recovery() -> None:
+    source = inspect.getsource(SourceManager.check_active_playback)
+
+    assert "self.refresh_source(self.current_site)" in source
+    assert "先刷新并重新准备播放器一次" in source
+
+
+def test_cursor_is_hidden_after_playback_progress_is_confirmed() -> None:
+    source = inspect.getsource(SourceManager.activate_source)
+
+    progress_check = source.index(
+        "if self._has_playback_progress(page, progress_wait_ms, site):"
+    )
+    hide_cursor = source.index("self.browser.hide_cursor(page)")
+    successful_return = source.index("return stabilized")
+    assert progress_check < hide_cursor < successful_return
+
+
+def test_high_quality_is_given_time_to_stabilize_before_720p_fallback() -> None:
+    source = inspect.getsource(SourceManager.activate_source)
+
+    assert "HIGH_QUALITY_SETTLE_MS" in source
+    assert "HIGH_QUALITY_PROGRESS_WAIT_MS" in source
+    assert "marker in state.quality for marker in (\"原画\", \"蓝光\")" in source

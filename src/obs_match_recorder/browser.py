@@ -6,6 +6,7 @@ import os
 import socket
 import re
 import subprocess
+import sys
 import time
 import ctypes
 from ctypes import WINFUNCTYPE, byref, c_bool, windll
@@ -26,11 +27,42 @@ class BrowserControllerError(RuntimeError):
 
 
 class BrowserController:
-    def __init__(self, cdp_url: str = "http://127.0.0.1:9222") -> None:
+    CRASH_RESTORE_SUPPRESSION_FLAG = "--hide-crash-restore-bubble"
+    HIDDEN_SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    HAIXING_COMPATIBILITY_SCRIPT = """
+        (() => {
+            if (!['video.club7275.top', 'video.jieli2050.top'].includes(window.location.hostname)) {
+                return;
+            }
+            try {
+                // 海星播放器把 CDP/自动化环境误判为调试攻击并显示 404。
+                window.localStorage.setItem('debug', '1');
+            } catch (_) {
+                // localStorage 受限时不影响正常页面加载。
+            }
+        })();
+    """
+
+    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", mode: str = "chrome") -> None:
         self.cdp_url = cdp_url.rstrip("/")
+        self.mode = self._normalize_mode(mode)
         self._playwright: Playwright | None = None
         self._context: BrowserContext | None = None
         self._managed_pages: list[Page] = []
+
+    def set_mode(self, mode: str) -> None:
+        mode = self._normalize_mode(mode)
+        if mode != self.mode:
+            self.close()
+            self.mode = mode
+
+    @staticmethod
+    def _normalize_mode(mode: object) -> str:
+        """将配置文件/旧版本保存的浏览器值统一为内部模式名。"""
+        value = str(mode or "").strip().lower()
+        if value in {"playwright", "playwright_browser", "playwright 浏览器"}:
+            return "playwright"
+        return "chrome"
 
     @staticmethod
     def _chrome_executable() -> Path | None:
@@ -55,6 +87,22 @@ class BrowserController:
 
     @staticmethod
     def _profile_directory() -> Path:
+        """返回项目专用 Chrome Profile，源码和打包运行保持同一路径。
+
+        PyInstaller 会把 ``__file__`` 解压到临时目录；如果继续按源码路径
+        推导，EXE 每次都会误用临时 Profile，和项目目录中的登录会话分离。
+        """
+        if getattr(sys, "frozen", False):
+            executable_dir = Path(sys.executable).resolve().parent
+            candidates = (
+                executable_dir.parent / "ChromeRecorderProfile",  # dist/EXE
+                executable_dir / "ChromeRecorderProfile",  # EXE 直接放在项目根
+            )
+            for profile in candidates:
+                if profile.is_dir():
+                    return profile
+            return candidates[0]
+
         # 项目根目录（src 布局下：browser.py 位于 <根>/src/obs_match_recorder/）
         project_root = Path(__file__).resolve().parent.parent.parent
         return project_root / "ChromeRecorderProfile"
@@ -81,7 +129,7 @@ class BrowserController:
                 f"Chrome 远程调试端口未开启：{host}:{port}。\n"
                 "当前普通 Chrome 不能通过远程调试接管。请完全退出 Chrome，"
                 "双击项目目录中的 start_chrome_debug.bat，"
-                "然后在新窗口登录咪咕和飞速。\n"
+                "然后在新窗口登录咪咕视频和海星体育。\n"
                 "等新 Chrome 打开后再点击“测试浏览器”。\n"
                 "对应命令：\n"
                 f'{chrome_command} --remote-debugging-port={port} '
@@ -120,19 +168,14 @@ class BrowserController:
 
         try:
             subprocess.Popen(
-                [
-                    str(chrome),
-                    f"--remote-debugging-port={port}",
-                    f"--user-data-dir={profile}",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ],
+                self._debug_chrome_command(chrome, port, profile),
                 cwd=str(profile),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=(
                     subprocess.CREATE_NEW_PROCESS_GROUP
+                    | self.HIDDEN_SUBPROCESS_FLAGS
                     if os.name == "nt"
                     else 0
                 ),
@@ -151,6 +194,24 @@ class BrowserController:
             "请确认项目专用 Chrome 窗口已打开。"
         )
 
+    @classmethod
+    def _debug_chrome_command(
+        cls,
+        chrome: Path,
+        port: int,
+        profile: Path,
+    ) -> list[str]:
+        """构造项目专用 Chrome 的稳定启动参数。"""
+
+        return [
+            str(chrome),
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            cls.CRASH_RESTORE_SUPPRESSION_FLAG,
+        ]
+
     def _ensure_cdp_ready(self) -> None:
         if not self._is_cdp_ready():
             self._start_debug_chrome()
@@ -166,6 +227,7 @@ class BrowserController:
                 capture_output=True,
                 text=True,
                 check=False,
+                creationflags=self.HIDDEN_SUBPROCESS_FLAGS,
             ).stdout
         except OSError:
             return None
@@ -271,6 +333,15 @@ class BrowserController:
                 self.close()
 
         try:
+            if self.mode == "playwright":
+                self._playwright = sync_playwright().start()
+                profile = self._profile_directory() / "PlaywrightProfile"
+                profile.mkdir(parents=True, exist_ok=True)
+                self._context = self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(profile), headless=False,
+                )
+                self._context.add_init_script(self.HAIXING_COMPATIBILITY_SCRIPT)
+                return
             self._ensure_cdp_ready()
             # 这里不会 launch Playwright 自带 Chromium。
             # Chrome 进程由 _start_debug_chrome() 使用 chrome.exe 启动，
@@ -287,6 +358,9 @@ class BrowserController:
                 )
 
             self._context = browser.contexts[0]
+            # 必须在海星 iframe 的脚本执行前设置，播放器随后才不会触发
+            # 反调试分支将页面替换为 404。
+            self._context.add_init_script(self.HAIXING_COMPATIBILITY_SCRIPT)
 
         except Exception as error:
             self.close()
@@ -304,6 +378,9 @@ class BrowserController:
         for attempt in range(2):
             try:
                 page = self._context.new_page()
+                # 通过 CDP 接管已有 Chrome 时，context 级 init script 在部分
+                # Chrome 版本上不会传递到后续跨域 OOPIF；页面级注入更可靠。
+                page.add_init_script(self.HAIXING_COMPATIBILITY_SCRIPT)
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 self._managed_pages.append(page)
                 return page
@@ -357,11 +434,9 @@ class BrowserController:
 
     @staticmethod
     def hide_cursor(page: Page) -> None:
-        """隐藏网页中的鼠标光标，并把系统鼠标移到左上角一次。"""
+        """隐藏网页中的鼠标光标，并把系统鼠标移到主屏最右下角。"""
 
-        try:
-            page.evaluate(
-                """
+        script = """
                 () => {
                     let style = document.getElementById(
                         'obs-match-recorder-cursor-style'
@@ -384,13 +459,20 @@ class BrowserController:
                     );
                 }
                 """
-            )
-        except Exception:
-            pass
+        for frame in page.frames:
+            try:
+                frame.evaluate(script)
+            except Exception:
+                continue
 
         if os.name == "nt":
             try:
-                windll.user32.SetCursorPos(1, 1)
+                screen_width = windll.user32.GetSystemMetrics(0)
+                screen_height = windll.user32.GetSystemMetrics(1)
+                windll.user32.SetCursorPos(
+                    max(0, screen_width - 1),
+                    max(0, screen_height - 1),
+                )
             except Exception:
                 pass
 
@@ -398,9 +480,7 @@ class BrowserController:
     def restore_cursor(page: Page) -> None:
         """任务结束后恢复页面的正常鼠标样式。"""
 
-        try:
-            page.evaluate(
-                """
+        script = """
                 () => {
                     document.getElementById(
                         'obs-match-recorder-cursor-style'
@@ -409,9 +489,11 @@ class BrowserController:
                     document.body.style.removeProperty('cursor');
                 }
                 """
-            )
-        except Exception:
-            pass
+        for frame in page.frames:
+            try:
+                frame.evaluate(script)
+            except Exception:
+                continue
 
     def silence_other_pages(self, active_page: Page) -> None:
         """暂停并静音其它标签页中的媒体，避免录制时出现重音。"""
@@ -421,18 +503,19 @@ class BrowserController:
         for page in self._context.pages:
             if page is active_page or page.is_closed():
                 continue
-            try:
-                page.evaluate(
-                    """
+            for frame in page.frames:
+                try:
+                    frame.evaluate(
+                        """
                     () => document.querySelectorAll('video, audio').forEach(media => {
                         media.pause();
                         media.muted = true;
                         media.volume = 0;
                     })
-                    """
-                )
-            except Exception:
-                pass
+                        """
+                    )
+                except Exception:
+                    continue
 
     def close_unexpected_pages(
         self,
@@ -488,6 +571,7 @@ class BrowserController:
                     text=True,
                     check=False,
                     timeout=10,
+                    creationflags=self.HIDDEN_SUBPROCESS_FLAGS,
                 )
             except (OSError, subprocess.SubprocessError) as error:
                 raise BrowserControllerError(

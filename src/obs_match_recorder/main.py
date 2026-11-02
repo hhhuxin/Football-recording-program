@@ -27,11 +27,15 @@ from .source_manager import SourceManager
 
 
 class OBSMatchRecorderApp:
-    RECORDING_HEALTH_INTERVAL_MS = 3 * 60 * 1000
+    APP_VERSION = "V2.0"
+    RECORDING_HEALTH_INTERVAL_MS = 60 * 1000
+    MAX_UNCHANGED_OUTPUT_CHECKS = 2
+    # Playwright Sync API 不能跨线程使用；所有后台浏览器/OBS任务共用一个线程。
+    BACKGROUND_WORKER_COUNT = 1
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("OBS 比赛录制助手 V1.2")
+        self.root.title(f"OBS 比赛录制助手 {self.APP_VERSION}")
         self.root.minsize(820, 700)
 
         self.root.columnconfigure(0, weight=1)
@@ -43,7 +47,7 @@ class OBSMatchRecorderApp:
             "advance_start_minutes": tk.StringVar(value="5"),
             "max_recording_minutes": tk.StringVar(value="150"),
             "site_a_url": tk.StringVar(),
-            "site_b_url": tk.StringVar(),
+            "site_b_url": tk.StringVar(value="https://jlyuntianly.top/live/6"),
             "obs_recording_directory": tk.StringVar(),
             "obs_host": tk.StringVar(value="localhost"),
             "obs_port": tk.StringVar(value="4455"),
@@ -58,11 +62,16 @@ class OBSMatchRecorderApp:
         self.recording_health_after_id = None
         self.recording_health_active = False
         self.recording_recovery_active = False
+        self.last_obs_frame_fingerprint: str | None = None
+        self.unchanged_obs_frame_checks = 0
 
         self.browser = BrowserController()
 
+        # Playwright Sync API 的 Browser/Page 绑定创建它们的线程。
+        # 启动、监控、健康检查和恢复必须复用同一个工作线程，否则会触发
+        # "Cannot switch to a different thread"，并使 Sync API 无法重连。
         self.executor = ThreadPoolExecutor(
-            max_workers=3,
+            max_workers=self.BACKGROUND_WORKER_COUNT,
             thread_name_prefix="obs-match-recorder",
         )
 
@@ -114,8 +123,8 @@ class OBSMatchRecorderApp:
             ("比赛开始时间", "match_start_time"),
             ("提前启动（分钟）", "advance_start_minutes"),
             ("最大录制时长（分钟）", "max_recording_minutes"),
-            ("网站 A URL", "site_a_url"),
-            ("网站 B URL", "site_b_url"),
+            ("咪咕体育 URL", "site_a_url"),
+            ("海星体育 URL", "site_b_url"),
         ]
 
         for row, (label, key) in enumerate(fields):
@@ -404,6 +413,8 @@ class OBSMatchRecorderApp:
     def _apply_config(self, config: AppConfig) -> None:
         for name, variable in self.variables.items():
             variable.set(getattr(config, name))
+        if not config.site_b_url.strip():
+            self.variables["site_b_url"].set("https://jlyuntianly.top/live/6")
 
     def reload_config(self) -> None:
         self._apply_config(load_config())
@@ -470,27 +481,32 @@ class OBSMatchRecorderApp:
             return
 
         self.log(
-            "正在测试 OBS WebSocket 连接……"
+            "正在确认 OBS 已启动并测试 WebSocket 连接……"
         )
 
         self._run_in_background(
-            lambda: OBSController(
+            lambda: OBSController.ensure_available(
                 connection_from_config(config)
-            ).test_connection(),
+            ),
             self._show_obs_test_success,
         )
 
     def _show_obs_test_success(
         self,
-        version: str,
+        availability,
     ) -> None:
+        startup_message = (
+            "已自动启动 OBS，"
+            if availability.started_by_app
+            else "OBS 已在运行，"
+        )
         self.log(
-            f"OBS 连接测试通过：OBS Studio {version}。"
+            f"{startup_message}连接测试通过：OBS Studio {availability.version}。"
         )
 
         messagebox.showinfo(
             "OBS 连接成功",
-            f"已连接到 OBS Studio {version}。",
+            f"{startup_message}已连接到 OBS Studio {availability.version}。",
         )
 
     # =========================================================
@@ -501,6 +517,9 @@ class OBSMatchRecorderApp:
         config = self._collect_config()
 
         errors = validate_sites(config)
+
+        if not config.site_a_url and not config.site_b_url:
+            errors.append("请至少填写一个直播 URL。")
 
         if errors:
             messagebox.showwarning(
@@ -520,17 +539,16 @@ class OBSMatchRecorderApp:
                 config.site_a_url,
                 config.site_b_url,
             )
-
-            self.sources.prepare_backup_page("A", page_a)
-            self.sources.prepare_backup_page("B", page_b)
+            player_state = self.sources.prepare_haixing_test_playback()
 
             return (
                 page_a,
                 page_b,
-                page_a.title(),
+                page_a.title() if page_a is not None else "未配置",
                 page_b.title() if page_b is not None else "未配置",
-                page_a.url,
+                page_a.url if page_a is not None else "",
                 page_b.url if page_b is not None else "",
+                player_state,
             )
 
         def success(result) -> None:
@@ -541,32 +559,37 @@ class OBSMatchRecorderApp:
                 title_b,
                 url_a,
                 url_b,
+                player_state,
             ) = result
 
             self.log(
-                f"网站 A 打开成功：{title_a}"
+                f"咪咕体育：{title_a}"
             )
 
             self.log(
-                f"网站 A 地址：{url_a}"
+                f"咪咕体育地址：{url_a}"
             )
 
             self.log(
-                f"网站 B：{title_b if page_b is not None else '未配置，未打开'}"
+                f"海星体育：{title_b if page_b is not None else '未配置，未打开'}"
             )
 
             self.log(
-                f"网站 B 地址：{url_b}"
+                f"海星体育地址：{url_b}"
             )
 
-            self.log(
-                "Chrome 浏览器测试通过。"
-            )
+            if player_state is not None:
+                self.log(
+                    f"海星体育：播放={player_state.playing}，"
+                    f"静音={player_state.muted}，画质={player_state.quality}，"
+                    f"全屏={player_state.fullscreen}。此测试未启动录制。"
+                )
+                # 不弹出成功对话框，保持 Chrome 全屏播放在前台。
+                return
 
             messagebox.showinfo(
                 "浏览器测试成功",
-                "网站 A 已打开。"
-                + ("网站 B 也已打开。" if page_b is not None else "网站 B 未配置。"),
+                "页面已打开，请手动确认播放画面。此测试不会启动 OBS 录制。",
             )
 
         self._run_in_background(
@@ -670,8 +693,24 @@ class OBSMatchRecorderApp:
             return
 
         config = self._collect_config()
+        self.log("正在确认 OBS 已启动……")
 
         def work():
+            connection = connection_from_config(config)
+            availability = OBSController.ensure_available(connection)
+            obs = OBSController(connection)
+
+            # 到达计划时间后先开始 OBS 录制，再准备直播页面。这样即使
+            # 页面加载较慢，OBS 也已经进入录制状态。
+            obs.start_recording(config.obs_recording_directory)
+
+            # 采集方式优化不能阻断录制；某些 OBS 场景没有显示器采集源时
+            # 该操作会失败，但不应因此停止刚刚启动的录制。
+            try:
+                display_capture_names = obs.prefer_windows_graphics_capture()
+            except OBSControllerError:
+                display_capture_names = []
+
             # 打开页面、探测、等待可用源、激活首选源
             result = self.sources.open_and_select(
                 config.site_a_url,
@@ -691,17 +730,6 @@ class OBSMatchRecorderApp:
                 player_state,
             ) = result
 
-            # 浏览器与播放器就绪后，连接 OBS 并开始录制
-            obs = OBSController(
-                connection_from_config(config)
-            )
-
-            obs.test_connection()
-
-            obs.start_recording(
-                config.obs_recording_directory
-            )
-
             return (
                 page_a,
                 page_b,
@@ -710,6 +738,9 @@ class OBSMatchRecorderApp:
                 status_a,
                 status_b,
                 player_state,
+                availability,
+                display_capture_names,
+                None,
             )
 
         self._run_in_background(
@@ -727,7 +758,7 @@ class OBSMatchRecorderApp:
 
         self.log(
             f"启动录制失败：{error}。"
-            "项目专用 Chrome 已完成重试，30 秒后再次打开直播页面。"
+            "30 秒后将重新确认 OBS 并打开直播页面。"
         )
         self.root.after(
             30000,
@@ -754,6 +785,9 @@ class OBSMatchRecorderApp:
             status_a,
             status_b,
             player_state,
+            availability,
+            display_capture_names,
+            frame_fingerprint,
         ) = result
 
         self.sources.page_a = page_a
@@ -762,15 +796,28 @@ class OBSMatchRecorderApp:
         self.sources.current_site = selected.name
 
         self.recording_started_by_app = True
+        self.last_obs_frame_fingerprint = frame_fingerprint
+        self.unchanged_obs_frame_checks = 0
 
         self.log(
-            f"网站 A：{status_a.result.status} | "
+            "OBS 已自动启动。"
+            if availability.started_by_app
+            else "OBS 已在运行。"
+        )
+        if display_capture_names:
+            self.log(
+                "已将 OBS 显示器采集切换为 Windows Graphics Capture："
+                + "、".join(display_capture_names)
+            )
+
+        self.log(
+            f"咪咕视频：{status_a.result.status} | "
             f"评分：{status_a.result.score} | "
             f"播放：{status_a.result.video_playing}"
         )
 
         self.log(
-            f"网站 B：{status_b.result.status} | "
+            f"海星体育：{status_b.result.status} | "
             f"评分：{status_b.result.score} | "
             f"播放：{status_b.result.video_playing}"
         )
@@ -834,6 +881,8 @@ class OBSMatchRecorderApp:
         self.sources.stop()
         self._cancel_recording_health_check()
         self.recording_recovery_active = False
+        self.last_obs_frame_fingerprint = None
+        self.unchanged_obs_frame_checks = 0
 
         self.start_task_button.configure(
             state="normal"
@@ -855,10 +904,14 @@ class OBSMatchRecorderApp:
 
         config = self._collect_config()
 
-        self._run_in_background(
-            lambda: OBSController(
+        def stop_work():
+            self.sources.restore_active_cursor()
+            return OBSController(
                 connection_from_config(config)
-            ).stop_recording(),
+            ).stop_recording()
+
+        self._run_in_background(
+            stop_work,
             self._recording_stopped,
         )
 
@@ -940,11 +993,11 @@ class OBSMatchRecorderApp:
         config = self._collect_config()
 
         def work():
-            obs_recording = OBSController(
-                connection_from_config(config)
-            ).is_recording()
+            obs = OBSController(connection_from_config(config))
+            obs_recording = obs.is_recording()
             player_state, playback_ok = self.sources.check_active_playback()
-            return obs_recording, playback_ok, player_state
+            frame_fingerprint = obs.program_frame_fingerprint()
+            return obs_recording, playback_ok, player_state, frame_fingerprint
 
         self._run_in_background(
             work,
@@ -965,13 +1018,22 @@ class OBSMatchRecorderApp:
         if not self.task_active or not self.recording_started_by_app:
             return
 
-        obs_recording, playback_ok, player_state = result
-        if obs_recording and playback_ok:
+        obs_recording, playback_ok, player_state, frame_fingerprint = result
+        output_stalled = self._observe_obs_output(frame_fingerprint)
+        if obs_recording and playback_ok and not output_stalled:
             self.log(
                 "录制健康检查通过：OBS 正在录制，"
                 "当前直播画面仍在播放。"
             )
             self._schedule_recording_health_check()
+            return
+
+        if obs_recording and playback_ok and output_stalled:
+            self.log(
+                "录制健康检查发现 OBS 输出画面连续两次未变化，"
+                "正在重建 Chrome 播放和录制流程。"
+            )
+            self._start_recording_recovery("OBS 输出画面疑似冻结")
             return
 
         self.log(
@@ -982,11 +1044,27 @@ class OBSMatchRecorderApp:
         )
         self._start_recording_recovery("OBS 或直播播放状态异常")
 
+    def _observe_obs_output(self, frame_fingerprint: str) -> bool:
+        """记录 OBS 节目画面指纹，连续不变时判定为采集画面冻结。"""
+
+        if self.last_obs_frame_fingerprint != frame_fingerprint:
+            self.last_obs_frame_fingerprint = frame_fingerprint
+            self.unchanged_obs_frame_checks = 0
+            return False
+
+        self.unchanged_obs_frame_checks += 1
+        return (
+            self.unchanged_obs_frame_checks
+            >= self.MAX_UNCHANGED_OUTPUT_CHECKS
+        )
+
     def _start_recording_recovery(self, reason: str) -> None:
         if self.recording_recovery_active or not self.task_active:
             return
 
         self.recording_recovery_active = True
+        self.last_obs_frame_fingerprint = None
+        self.unchanged_obs_frame_checks = 0
         self.sources.invalidate_monitor_loop()
         config = self._collect_config()
         self.log(
@@ -995,7 +1073,10 @@ class OBSMatchRecorderApp:
         )
 
         def work():
-            obs = OBSController(connection_from_config(config))
+            connection = connection_from_config(config)
+            OBSController.ensure_available(connection)
+            obs = OBSController(connection)
+            display_capture_names = obs.prefer_windows_graphics_capture()
             try:
                 obs.stop_recording()
             except OBSControllerError:
@@ -1012,7 +1093,8 @@ class OBSMatchRecorderApp:
             if not self.task_active:
                 return None
             obs.start_recording(config.obs_recording_directory)
-            return result
+            frame_fingerprint = obs.program_frame_fingerprint()
+            return result, display_capture_names, frame_fingerprint
 
         self._run_in_background(
             work,
@@ -1026,6 +1108,7 @@ class OBSMatchRecorderApp:
         if not self.task_active or result is None:
             return
 
+        workflow_result, display_capture_names, frame_fingerprint = result
         (
             page_a,
             page_b,
@@ -1034,18 +1117,25 @@ class OBSMatchRecorderApp:
             status_a,
             status_b,
             player_state,
-        ) = result
+        ) = workflow_result
         self.sources.page_a = page_a
         self.sources.page_b = page_b
         self.sources.source_monitor = monitor
         self.sources.current_site = selected.name
         self.recording_started_by_app = True
+        self.last_obs_frame_fingerprint = frame_fingerprint
+        self.unchanged_obs_frame_checks = 0
 
         self.log(
             f"自动恢复完成：当前直播源为网站 {selected.name}，"
             f"播放={player_state.playing}，静音={player_state.muted}，"
             f"全屏={player_state.fullscreen}。"
         )
+        if display_capture_names:
+            self.log(
+                "已确认 OBS 显示器采集使用 Windows Graphics Capture："
+                + "、".join(display_capture_names)
+            )
         self.sources.start_monitor_loop()
         self._schedule_recording_health_check()
 
@@ -1183,15 +1273,14 @@ class OBSMatchRecorderApp:
 
         self.sources.close()
 
+        # BrowserController 也必须由创建 Playwright Sync API 的工作线程关闭。
+        # 不取消队列中的清理任务，确保 close 不会被 shutdown 丢弃。
         try:
-            self.browser.close()
-        except Exception:
+            self.executor.submit(self.browser.close)
+        except RuntimeError:
             pass
 
-        self.executor.shutdown(
-            wait=False,
-            cancel_futures=True,
-        )
+        self.executor.shutdown(wait=False, cancel_futures=False)
 
         self.root.destroy()
 

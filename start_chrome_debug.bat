@@ -14,7 +14,7 @@ if not errorlevel 1 goto :already_debug
 
 echo Starting Chrome in remote debugging mode...
 echo Profile: %~dp0ChromeRecorderProfile
-start "" "%CHROME_EXE%" --remote-debugging-port=9222 --user-data-dir="%~dp0ChromeRecorderProfile" --no-first-run
+start "" "%CHROME_EXE%" --remote-debugging-port=9222 --user-data-dir="%~dp0ChromeRecorderProfile" --no-first-run --hide-crash-restore-bubble
 
 echo.
 echo Chrome should now be open on port 9222.

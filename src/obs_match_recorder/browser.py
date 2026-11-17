@@ -31,7 +31,10 @@ class BrowserController:
     HIDDEN_SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     HAIXING_COMPATIBILITY_SCRIPT = """
         (() => {
-            if (!['video.club7275.top', 'video.jieli2050.top'].includes(window.location.hostname)) {
+            const host = window.location.hostname.toLowerCase();
+            const knownHost = ['video.club7275.top', 'video.jieli2050.top', 'video.jlit8.top', 'video.ehmtcs.top', 'video.cretebl.com'].includes(host);
+            // 海星会轮换 video.* 域名；不能只依赖当天的固定名单。
+            if (!knownHost && !host.startsWith('video.')) {
                 return;
             }
             try {

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
+import shutil
 import socket
 import subprocess
 import time
@@ -38,7 +40,7 @@ class OBSController:
     STARTUP_TIMEOUT_SECONDS = 30.0
     STARTUP_POLL_INTERVAL_SECONDS = 1.0
     DISPLAY_CAPTURE_INPUT_KIND = "monitor_capture"
-    WINDOWS_GRAPHICS_CAPTURE_METHOD = 1
+    WINDOWS_GRAPHICS_CAPTURE_METHOD = 2
     SCREENSHOT_WIDTH = 320
     SCREENSHOT_HEIGHT = 180
 
@@ -70,10 +72,10 @@ class OBSController:
 
         started_by_app = False
         if not (is_process_running or cls._is_process_running)():
-            executable = executable_path or cls.DEFAULT_EXECUTABLE_PATH
-            if not executable.is_file():
+            executable = executable_path if executable_path is not None else cls._find_executable()
+            if executable is None or not executable.is_file():
                 raise OBSControllerError(
-                    f"OBS 未运行，且未找到启动程序：{executable}。\n"
+                    f"OBS 未运行，且未找到启动程序：{executable or '已检查注册表、PATH 和各磁盘常用安装目录'}。\n"
                     "请确认 OBS 安装位置，或手动启动 OBS Studio。"
                 ) from initial_error
 
@@ -122,6 +124,54 @@ class OBSController:
             "并确认端口和密码与本程序一致。\n"
             f"最后一次错误：{last_error}"
         ) from last_error
+
+    @classmethod
+    def _find_executable(cls) -> Path | None:
+        """从 Windows 安装信息和常用目录定位 OBS，兼容其他电脑。"""
+
+        candidates: list[Path] = []
+        try:
+            import winreg
+
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                    try:
+                        with winreg.OpenKey(
+                            hive,
+                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio",
+                            0,
+                            winreg.KEY_READ | view,
+                        ) as key:
+                            for name in ("InstallLocation", "UninstallString"):
+                                try:
+                                    value = winreg.QueryValueEx(key, name)[0]
+                                except OSError:
+                                    continue
+                                if not isinstance(value, str) or not value.strip():
+                                    continue
+                                if name == "UninstallString":
+                                    value = value.split('"')[1] if value.startswith('"') else value
+                                    root = Path(value).parent
+                                else:
+                                    root = Path(value.strip('"'))
+                                candidates.append(root / "bin" / "64bit" / "obs64.exe")
+                    except OSError:
+                        continue
+        except ImportError:
+            pass
+
+        on_path = shutil.which("obs64.exe")
+        if on_path:
+            candidates.append(Path(on_path))
+        for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            root = os.environ.get(name)
+            if root:
+                candidates.append(Path(root) / "obs-studio" / "bin" / "64bit" / "obs64.exe")
+        candidates.append(cls.DEFAULT_EXECUTABLE_PATH)
+        for drive in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            candidates.append(Path(f"{drive}:/Program Files/obs-studio/bin/64bit/obs64.exe"))
+            candidates.append(Path(f"{drive}:/obs-studio/bin/64bit/obs64.exe"))
+        return next((path for path in candidates if path.is_file()), None)
 
     @staticmethod
     def _is_process_running() -> bool:
@@ -226,10 +276,10 @@ class OBSController:
             ) from error
 
     def prefer_windows_graphics_capture(self) -> list[str]:
-        """将现有显示器采集切换为 Windows Graphics Capture。
+        """将现有显示器采集切换为本机已采用的 DXGI。
 
-        OBS 的 ``monitor_capture`` 源以整数保存采集方式：0 是 DXGI，1 是
-        Windows Graphics Capture。后者对 Chrome 的硬件视频画面更稳定。
+        OBS 的 ``monitor_capture`` 源以整数保存采集方式：0 是自动，1 是
+        DXGI，2 是 Windows Graphics Capture。
         """
 
         client = self._client()
@@ -246,7 +296,9 @@ class OBSController:
 
                 client.set_input_settings(
                     name,
-                    {"method": self.WINDOWS_GRAPHICS_CAPTURE_METHOD},
+                    # 本机当前显示器使用 DXGI 可正常产生画面；此前强制 WGC
+                    # 录出的文件出现长时间全黑，先使用兼容性更高的 DXGI。
+                    {"method": 1},
                     True,
                 )
                 updated_names.append(name)

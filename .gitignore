@@ -43,6 +43,8 @@ dist/
 # Browser automation profile: contains login sessions, cookies, cache, and
 # other machine-specific Chrome data.
 ChromeRecorderProfile/
+ChromeRecorderProfile_*/
+backups/
 
 # Local runtime logs and temporary files
 logs/

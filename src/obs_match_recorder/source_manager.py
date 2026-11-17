@@ -101,6 +101,32 @@ class SourceManager:
             except Exception:
                 pass
 
+        # 停止监控并不会自动停止网页中的 HTML5 播放器。若只停 OBS，直播页仍会
+        # 继续播放并占用声音/网络，因此在结束任务时显式暂停所有受管页面媒体。
+        self.pause_active_playback()
+
+    def pause_active_playback(self) -> None:
+        """暂停当前及备用直播页中的 video/audio，不关闭用户浏览器。"""
+        pages = [self.page_a, self.page_b]
+        script = """
+        () => {
+            let count = 0;
+            for (const media of document.querySelectorAll('video, audio')) {
+                try { media.pause(); media.muted = true; media.volume = 0; count++; }
+                catch (_) {}
+            }
+            return count;
+        }
+        """
+        for page in pages:
+            if page is None or page.is_closed():
+                continue
+            for frame in page.frames:
+                try:
+                    frame.evaluate(script)
+                except Exception:
+                    continue
+
     def close(self) -> None:
         """关闭所有页面与监控（程序退出时调用）。"""
 

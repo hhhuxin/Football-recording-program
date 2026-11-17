@@ -9,6 +9,7 @@ from __future__ import annotations
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from dataclasses import replace
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .browser import BrowserController, BrowserControllerError
@@ -24,10 +25,11 @@ from .config import (
 from .obs_controller import OBSController, OBSControllerError
 from .scheduler import TIME_FORMAT, scheduled_start_time
 from .source_manager import SourceManager
+from .fixtures import fetch_next_fixture
 
 
 class OBSMatchRecorderApp:
-    APP_VERSION = "V2.0"
+    APP_VERSION = "V2.2"
     RECORDING_HEALTH_INTERVAL_MS = 60 * 1000
     MAX_UNCHANGED_OUTPUT_CHECKS = 2
     # Playwright Sync API 不能跨线程使用；所有后台浏览器/OBS任务共用一个线程。
@@ -55,6 +57,7 @@ class OBSMatchRecorderApp:
         }
 
         self.task_active = False
+        self.fixture_loading = False
         self.recording_started_by_app = False
         self.scheduled_time: datetime | None = None
         self.recording_deadline: datetime | None = None
@@ -96,6 +99,7 @@ class OBSMatchRecorderApp:
         self.log(
             "程序已启动。请填写配置后保存、测试或启动定时任务。"
         )
+        self.root.after(200, self.refresh_barcelona_fixture)
 
     # =========================================================
     # 界面
@@ -163,7 +167,13 @@ class OBSMatchRecorderApp:
                     self._clear_time_hint,
                 )
 
-        directory_row = len(fields)
+        self.fixture_button = ttk.Button(
+            form, text="自动读取巴萨下一场比赛（北京时间）",
+            command=self.refresh_barcelona_fixture,
+        )
+        self.fixture_button.grid(row=len(fields), column=0, columnspan=3, sticky="w", pady=5)
+
+        directory_row = len(fields) + 1
 
         ttk.Label(
             form,
@@ -419,6 +429,42 @@ class OBSMatchRecorderApp:
     def reload_config(self) -> None:
         self._apply_config(load_config())
         self.log("已从磁盘重新读取配置。")
+
+    def refresh_barcelona_fixture(self) -> None:
+        if self.fixture_loading:
+            return
+        if self.task_active:
+            self.log("任务运行中，暂不更新比赛配置。请停止任务后刷新赛程。")
+            return
+        self.fixture_loading = True
+        self.fixture_button.configure(state="disabled")
+        self.log("正在从巴萨官网读取下一场比赛……")
+
+        def finish() -> None:
+            self.fixture_loading = False
+            self.fixture_button.configure(state="normal")
+
+        def success(fixture) -> None:
+            finish()
+            if self.task_active:
+                self.log("任务已启动，本次赛程结果不覆盖正在使用的配置。")
+                return
+            start = fixture.kickoff.strftime(TIME_FORMAT)
+            # 仅更新这两个持久化字段，保留已有 URL、密码及其他配置。
+            try:
+                save_config(replace(load_config(), match_name=fixture.name, match_start_time=start))
+            except OSError as error:
+                self.log(f"赛程已读取但保存失败，原界面配置保留：{error}")
+                return
+            self.variables["match_name"].set(fixture.name)
+            self.variables["match_start_time"].set(start)
+            self.log(f"已自动填写并保存：{fixture.name}；北京时间 {start}。")
+
+        def failure(error) -> None:
+            finish()
+            self.log(f"读取巴萨赛程失败，原配置保留：{error}；可点击自动读取按钮重试。")
+
+        self._run_in_background(fetch_next_fixture, success, on_error=failure)
 
     def save_current_config(self) -> None:
         config_path = save_config(
@@ -700,12 +746,8 @@ class OBSMatchRecorderApp:
             availability = OBSController.ensure_available(connection)
             obs = OBSController(connection)
 
-            # 到达计划时间后先开始 OBS 录制，再准备直播页面。这样即使
-            # 页面加载较慢，OBS 也已经进入录制状态。
-            obs.start_recording(config.obs_recording_directory)
-
             # 采集方式优化不能阻断录制；某些 OBS 场景没有显示器采集源时
-            # 该操作会失败，但不应因此停止刚刚启动的录制。
+            # 该操作会失败，但不应因此阻断后续录制。
             try:
                 display_capture_names = obs.prefer_windows_graphics_capture()
             except OBSControllerError:
@@ -719,6 +761,9 @@ class OBSMatchRecorderApp:
 
             if result is None:
                 return None
+
+            # 等直播源确认并开始播放后再启动 OBS，避免等待直播时录出长时间黑屏。
+            obs.start_recording(config.obs_recording_directory)
 
             (
                 page_a,
@@ -905,6 +950,8 @@ class OBSMatchRecorderApp:
         config = self._collect_config()
 
         def stop_work():
+            # 先暂停网页媒体，再停止 OBS，避免“任务结束但直播继续播放”。
+            self.sources.pause_active_playback()
             self.sources.restore_active_cursor()
             return OBSController(
                 connection_from_config(config)

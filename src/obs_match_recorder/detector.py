@@ -35,7 +35,12 @@ class LiveDetector:
         for frame in self.page.frames:
             if frame is self.page.main_frame:
                 continue
-            if "video.club7275.top" in frame.url:
+            try:
+                frame_host = (frame.url.split("//", 1)[-1].split("/", 1)[0]
+                              .split(":", 1)[0].lower())
+            except Exception:
+                frame_host = ""
+            if frame_host.startswith("video."):
                 return frame
             try:
                 if frame.locator("#dplayer, video").count():
